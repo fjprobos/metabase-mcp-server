@@ -157,6 +157,54 @@ claude mcp add --transport http metabase "https://your-deployment.example.com/mc
 
 ---
 
+## 🔐 OAuth Gateway (Claude.ai Web)
+
+Claude.ai web requires full **OAuth 2.0 Authorization Code + PKCE** to connect to remote MCP servers. The OAuth Gateway handles this flow and proxies requests to the FastMCP HTTP Stream server.
+
+### Architecture
+
+```
+Claude.ai ──→ OAuth Gateway (port 8080)
+              ├── /.well-known/oauth-authorization-server  (discovery)
+              ├── /oauth/authorize  →  login form (Metabase URL + API key)
+              ├── /oauth/token      →  issues signed JWT
+              └── /mcp              →  proxy + inject headers  →  FastMCP (port 8011)
+```
+
+### Starting both servers
+
+```bash
+# Terminal 1 — FastMCP HTTP Stream (internal)
+MCP_TRANSPORT=http PORT=8011 node dist/server.js --all
+
+# Terminal 2 — OAuth Gateway (public-facing)
+GATEWAY_URL=https://your-mcp-server.com \
+GATEWAY_PORT=8080 \
+MCP_UPSTREAM=http://localhost:8011 \
+JWT_SECRET=your-random-secret \
+node dist/oauth-gateway.js
+```
+
+### Environment variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `GATEWAY_URL` | `http://localhost:8080` | Public URL of the gateway (shown in OAuth discovery) |
+| `GATEWAY_PORT` | `8080` | Port to listen on |
+| `MCP_UPSTREAM` | `http://localhost:8011` | Internal FastMCP server URL |
+| `JWT_SECRET` | *(random — changes on restart)* | Secret for signing JWT tokens. **Must be set in production.** |
+| `TOKEN_EXPIRY` | `8h` | JWT expiry (e.g. `1h`, `24h`) |
+
+### Connecting Claude.ai web
+
+1. In Claude.ai, go to **Settings → Integrations → Add MCP server**
+2. Enter: `https://your-mcp-server.com/mcp`
+3. Claude.ai detects the OAuth endpoint automatically and opens the login form
+4. Enter your Metabase URL and API key → click **Conectar**
+5. Claude.ai receives the token and the connection is established
+
+---
+
 ## 🔌 Integration Examples
 
 ### Claude Desktop
