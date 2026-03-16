@@ -145,6 +145,58 @@ app.get('/.well-known/openid-configuration', (_req: Request, res: Response) => {
   });
 });
 
+// ── Google SSO helpers ───────────────────────────────────────────────────────
+// These two endpoints proxy requests to Metabase server-side to avoid CORS
+// issues when the gateway and Metabase live on different origins.
+
+// Returns the Google OAuth client ID configured in a given Metabase instance.
+app.get('/oauth/metabase-properties', async (req: Request, res: Response) => {
+  const { url } = req.query as Record<string, string>;
+  if (!url) {
+    res.status(400).json({ error: 'url required' });
+    return;
+  }
+  try {
+    const upstream = `${url.replace(/\/$/, '')}/api/session/properties`;
+    const response = await fetch(upstream, { signal: AbortSignal.timeout(5000) });
+    if (!response.ok) {
+      res.status(response.status).json({ error: 'upstream error' });
+      return;
+    }
+    const data = await response.json() as Record<string, any>;
+    res.json({ 'google-auth-client-id': data['google-auth-client-id'] || null });
+  } catch {
+    res.status(502).json({ error: 'could not reach Metabase' });
+  }
+});
+
+// Exchanges a Google ID token for a Metabase session token.
+app.post('/oauth/metabase-google-auth', async (req: Request, res: Response) => {
+  const { metabase_url, google_token } = req.body as Record<string, string>;
+  if (!metabase_url || !google_token) {
+    res.status(400).json({ error: 'metabase_url and google_token required' });
+    return;
+  }
+  try {
+    const upstream = `${metabase_url.replace(/\/$/, '')}/api/session/google_auth`;
+    const response = await fetch(upstream, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: google_token }),
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!response.ok) {
+      const detail = await response.text();
+      res.status(response.status).json({ error: 'Metabase rejected the Google token', detail });
+      return;
+    }
+    const data = await response.json() as Record<string, any>;
+    res.json({ session_token: data.id });
+  } catch {
+    res.status(502).json({ error: 'could not reach Metabase' });
+  }
+});
+
 // ── Authorization endpoint ───────────────────────────────────────────────────
 
 app.get('/oauth/authorize', (req: Request, res: Response) => {
@@ -197,16 +249,31 @@ app.get('/oauth/authorize', (req: Request, res: Response) => {
     input:focus { border-color: #6366f1; box-shadow: 0 0 0 3px rgba(99,102,241,.15); }
     .divider { display: flex; align-items: center; gap: .5rem; margin: 1.25rem 0 .5rem; color: #9ca3af; font-size: .75rem; }
     .divider::before, .divider::after { content: ''; flex: 1; height: 1px; background: #e5e7eb; }
-    button {
+    button[type=submit] {
       margin-top: 1.5rem; width: 100%;
       background: #6366f1; color: #fff;
       border: none; border-radius: 8px;
       padding: .75rem; font-size: 1rem; font-weight: 500;
       cursor: pointer; transition: background .15s;
     }
-    button:hover { background: #4f46e5; }
+    button[type=submit]:hover { background: #4f46e5; }
     .error { color: #dc2626; font-size: .8rem; margin-top: .5rem; display: none; }
     .error.visible { display: block; }
+    #google-sso-section { display: none; margin-top: .5rem; }
+    .btn-google {
+      display: flex; align-items: center; justify-content: center; gap: .6rem;
+      width: 100%; padding: .65rem .75rem;
+      background: #fff; color: #3c4043;
+      border: 1px solid #dadce0; border-radius: 8px;
+      font-size: .9rem; font-weight: 500; cursor: pointer;
+      transition: background .15s, box-shadow .15s;
+    }
+    .btn-google:hover { background: #f8f9fa; box-shadow: 0 1px 3px rgba(0,0,0,.12); }
+    .btn-google:disabled { opacity: .6; cursor: not-allowed; }
+    .btn-google svg { flex-shrink: 0; }
+    .sso-status { font-size: .78rem; margin-top: .5rem; color: #6b7280; min-height: 1.2em; }
+    .sso-status.ok  { color: #16a34a; }
+    .sso-status.err { color: #dc2626; }
   </style>
 </head>
 <body>
@@ -222,13 +289,22 @@ app.get('/oauth/authorize', (req: Request, res: Response) => {
 
       <label for="metabase_url">URL de Metabase</label>
       <input type="url" id="metabase_url" name="metabase_url"
-             placeholder="https://analytics.example.com" required>
+             placeholder="https://analytics.example.com"
+             value="https://analytics.clay.cl/" required>
+
+      <button type="button" class="btn-google" id="btn-google" onclick="startGoogleSSO()" style="margin-top:1rem">
+        <svg width="18" height="18" viewBox="0 0 48 48"><path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/><path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/><path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/><path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.18 1.48-4.97 2.35-8.16 2.35-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/><path fill="none" d="M0 0h48v48H0z"/></svg>
+        Continuar con Google
+      </button>
+      <p class="sso-status" id="sso-status"></p>
+
+      <div class="divider">o usa API Key</div>
 
       <label for="metabase_api_key">API Key</label>
       <input type="password" id="metabase_api_key" name="metabase_api_key"
              placeholder="mb_xxxxxxxx">
 
-      <div class="divider">o usa usuario y contraseña</div>
+      <div class="divider">o usuario y contraseña</div>
 
       <label for="metabase_username">Usuario</label>
       <input type="text" id="metabase_username" name="metabase_username"
@@ -237,16 +313,13 @@ app.get('/oauth/authorize', (req: Request, res: Response) => {
       <label for="metabase_password">Contraseña</label>
       <input type="password" id="metabase_password" name="metabase_password">
 
-      <div class="divider">o usa un token de sesión (Google SSO)</div>
+      <div class="divider">o pega el token manualmente</div>
 
       <label for="metabase_session_token">Token de sesión</label>
       <input type="password" id="metabase_session_token" name="metabase_session_token"
              placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx">
       <p style="color:#6b7280;font-size:.75rem;margin-top:.4rem">
-        Si tu Metabase usa Google SSO, inicia sesión en el browser, abre
-        DevTools → Application → Cookies y copia el valor de
-        <code>metabase.SESSION</code>. El token expira según la
-        configuración de tu instancia.
+        DevTools → Application → Cookies → <code>metabase.SESSION</code>
       </p>
 
       <p class="error" id="err">Debes ingresar una API Key, usuario + contraseña, o un token de sesión.</p>
@@ -255,6 +328,7 @@ app.get('/oauth/authorize', (req: Request, res: Response) => {
     </form>
   </div>
   <script>
+    // ── Form validation ───────────────────────────────────────────────────────
     document.getElementById('form').addEventListener('submit', function(e) {
       var key     = document.getElementById('metabase_api_key').value.trim();
       var user    = document.getElementById('metabase_username').value.trim();
@@ -265,6 +339,100 @@ app.get('/oauth/authorize', (req: Request, res: Response) => {
         document.getElementById('err').classList.add('visible');
       }
     });
+
+    // ── Google SSO client ID (fetched lazily on first click) ─────────────────
+    var googleClientId = null;
+
+    async function fetchClientId(url) {
+      if (googleClientId) return googleClientId;
+      var resp = await fetch('/oauth/metabase-properties?url=' + encodeURIComponent(url));
+      var data = await resp.json();
+      googleClientId = data['google-auth-client-id'] || null;
+      return googleClientId;
+    }
+
+    // ── Google Sign-In flow ───────────────────────────────────────────────────
+    function setStatus(msg, type) {
+      var el = document.getElementById('sso-status');
+      el.textContent = msg;
+      el.className = 'sso-status' + (type ? ' ' + type : '');
+    }
+
+    function loadGSI(clientId) {
+      return new Promise(function(resolve, reject) {
+        if (typeof google !== 'undefined' && google.accounts) { resolve(); return; }
+        var s = document.createElement('script');
+        s.src = 'https://accounts.google.com/gsi/client';
+        s.onload = resolve;
+        s.onerror = reject;
+        document.head.appendChild(s);
+      });
+    }
+
+    async function startGoogleSSO() {
+      var url = document.getElementById('metabase_url').value.trim();
+      if (!url) { setStatus('Primero ingresa la URL de Metabase.', 'err'); return; }
+
+      var btn = document.getElementById('btn-google');
+      btn.disabled = true;
+      setStatus('Cargando...', '');
+
+      try {
+        await fetchClientId(url);
+        if (!googleClientId) {
+          setStatus('Esta instancia de Metabase no tiene Google SSO habilitado.', 'err');
+          btn.disabled = false;
+          return;
+        }
+
+        setStatus('Abriendo ventana de Google...', '');
+        await loadGSI(googleClientId);
+
+        google.accounts.id.initialize({
+          client_id: googleClientId,
+          callback: async function(response) {
+            setStatus('Autenticando con Metabase...', '');
+            try {
+              var authResp = await fetch('/oauth/metabase-google-auth', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ metabase_url: url, google_token: response.credential }),
+              });
+              var authData = await authResp.json();
+              if (authData.session_token) {
+                setStatus('Autenticado. Conectando...', 'ok');
+                document.getElementById('metabase_session_token').value = authData.session_token;
+                document.getElementById('form').submit();
+              } else {
+                setStatus('Error: ' + (authData.error || 'respuesta inesperada de Metabase'), 'err');
+                btn.disabled = false;
+              }
+            } catch (e) {
+              setStatus('Error al comunicarse con Metabase.', 'err');
+              btn.disabled = false;
+            }
+          },
+          auto_select: false,
+          cancel_on_tap_outside: true,
+        });
+
+        google.accounts.id.prompt(function(notification) {
+          if (notification.isNotDisplayed() || notification.isSkippedMoment()) {
+            // One-tap not available — fall back to popup
+            google.accounts.id.renderButton(
+              document.getElementById('btn-google'),
+              { theme: 'outline', size: 'large', width: 340 }
+            );
+            btn.disabled = false;
+            setStatus('', '');
+          }
+        });
+
+      } catch(e) {
+        setStatus('No se pudo cargar Google Sign-In.', 'err');
+        btn.disabled = false;
+      }
+    }
   </script>
 </body>
 </html>`);
