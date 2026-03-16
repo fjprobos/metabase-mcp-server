@@ -361,6 +361,7 @@ app.use('/mcp', (req: Request, res: Response) => {
   res.on('finish', () => {
     log('info', `${req.method} /mcp session=${session} method=${method} status=${res.statusCode} ms=${Date.now() - start}`);
   });
+
   const auth = req.headers['authorization'] as string | undefined;
   if (!auth?.startsWith('Bearer ')) {
     res.status(401).json({ error: 'Bearer token required' });
@@ -372,6 +373,14 @@ app.use('/mcp', (req: Request, res: Response) => {
     payload = jwt.verify(auth.slice(7), JWT_SECRET) as Record<string, string>;
   } catch {
     res.status(401).json({ error: 'invalid_token', error_description: 'Token invalid or expired' });
+    return;
+  }
+
+  // notifications/initialized is a fire-and-forget notification — acknowledge immediately.
+  // The upstream returns 400 when it receives this without a session context (stateless mode),
+  // so we handle it at the gateway level instead of proxying.
+  if (req.method === 'POST' && method === 'notifications/initialized') {
+    res.status(202).end();
     return;
   }
 
@@ -408,43 +417,56 @@ app.use('/mcp', (req: Request, res: Response) => {
   // Disable socket timeout for SSE (long-lived streams)
   if (res.socket) res.socket.setTimeout(0);
 
-  const proxyReq = http.request({
-    hostname: upstream.hostname,
-    port:     upstream.port || 80,
-    method:   req.method,
-    path:     upstreamPath,
-    headers:  proxyHeaders,
-  }, (proxyRes) => {
-    // For SSE, disable socket timeout on the upstream side too
-    if (proxyRes.socket) proxyRes.socket.setTimeout(0);
+  const hopByHop = new Set(['transfer-encoding', 'connection', 'keep-alive', 'proxy-connection', 'upgrade', 'te', 'trailer']);
 
-    // Filter hop-by-hop headers that must not be forwarded to avoid double-encoding
-    const hopByHop = new Set(['transfer-encoding', 'connection', 'keep-alive', 'proxy-connection', 'upgrade', 'te', 'trailer']);
-    const responseHeaders: Record<string, string | string[]> = {};
-    for (const [k, v] of Object.entries(proxyRes.headers)) {
-      if (!hopByHop.has(k.toLowerCase()) && v !== undefined) {
-        responseHeaders[k] = v as string | string[];
+  // Forward a request to the upstream, returning a promise that resolves with the upstream response.
+  // Buffers the body so we can retry on 400 (race condition during server startup in stateless mode).
+  const doProxy = (attempt: number) => {
+    const proxyReq = http.request({
+      hostname: upstream.hostname,
+      port:     upstream.port || 80,
+      method:   req.method,
+      path:     upstreamPath,
+      headers:  proxyHeaders,
+    }, (proxyRes) => {
+      if (proxyRes.socket) proxyRes.socket.setTimeout(0);
+
+      const status = proxyRes.statusCode || 200;
+
+      // Retry once on 400 for non-initialize methods — upstream may not be ready yet (stateless race condition)
+      if (status === 400 && method !== 'initialize' && attempt < 2) {
+        log('debug', `Upstream 400 on ${method} (attempt ${attempt}), retrying in 60ms`);
+        proxyRes.resume(); // drain the response
+        setTimeout(() => doProxy(attempt + 1), 60);
+        return;
       }
+
+      const responseHeaders: Record<string, string | string[]> = {};
+      for (const [k, v] of Object.entries(proxyRes.headers)) {
+        if (!hopByHop.has(k.toLowerCase()) && v !== undefined) {
+          responseHeaders[k] = v as string | string[];
+        }
+      }
+
+      res.writeHead(status, responseHeaders);
+      res.flushHeaders();
+      proxyRes.pipe(res, { end: true });
+    });
+
+    proxyReq.setTimeout(0);
+    proxyReq.on('error', (err) => {
+      log('error', `Proxy error: ${err.message}`);
+      if (!res.headersSent) res.status(502).json({ error: 'upstream_error' });
+    });
+
+    if (bodyStr) {
+      proxyReq.end(bodyStr);
+    } else {
+      proxyReq.end();
     }
+  };
 
-    res.writeHead(proxyRes.statusCode || 200, responseHeaders);
-    // Flush headers immediately (critical for SSE)
-    res.flushHeaders();
-    proxyRes.pipe(res, { end: true });
-  });
-
-  proxyReq.setTimeout(0); // no timeout for SSE
-
-  proxyReq.on('error', (err) => {
-    log('error', `Proxy error: ${err.message}`);
-    if (!res.headersSent) res.status(502).json({ error: 'upstream_error' });
-  });
-
-  if (bodyStr) {
-    proxyReq.end(bodyStr);
-  } else {
-    proxyReq.end();
-  }
+  doProxy(1);
 });
 
 // ── Health ───────────────────────────────────────────────────────────────────
@@ -459,8 +481,8 @@ export { app };
 
 if (process.argv[1] && new URL(import.meta.url).pathname === process.argv[1]) {
   app.listen(GATEWAY_PORT, () => {
-    log('INFO', `OAuth MCP gateway on port ${GATEWAY_PORT}`);
-    log('INFO', `Proxying /mcp  →  ${MCP_UPSTREAM}/mcp`);
-    log('INFO', `Public URL: ${GATEWAY_URL}`);
+    log('info', `OAuth MCP gateway on port ${GATEWAY_PORT}`);
+    log('info', `Proxying /mcp  →  ${MCP_UPSTREAM}/mcp`);
+    log('info', `Public URL: ${GATEWAY_URL}`);
   });
 }
