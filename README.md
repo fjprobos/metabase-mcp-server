@@ -97,6 +97,114 @@ node dist/server.js --write           # Write tools only
 node dist/server.js --read            # Read-only tools only
 ```
 
+## 🌐 HTTP Stream Transport (Shared Deployment)
+
+The server supports an **HTTP Stream transport** mode that lets a single deployed instance serve multiple users — each request provides its own Metabase credentials via headers. This is the recommended approach for cloud/SaaS deployments and is required by modern MCP clients like **Claude Code CLI**.
+
+### Why HTTP Stream?
+
+| | stdio (classic) | HTTP Stream (new) |
+|---|---|---|
+| Deployment | One process per user | One shared process |
+| Credentials | Env vars at startup | Per-request headers |
+| Claude Code CLI | ❌ Not supported | ✅ Supported |
+| Cursor, Windsurf | ✅ Supported | ✅ Supported |
+
+### Starting in HTTP Stream mode
+
+```bash
+MCP_TRANSPORT=http node dist/server.js
+# or with custom port:
+MCP_TRANSPORT=http PORT=8011 node dist/server.js --all
+```
+
+### Connecting from Claude Code CLI
+
+```bash
+claude mcp add --transport http metabase "https://your-deployment.example.com/mcp" \
+  --header "x-metabase-url: https://your-metabase-instance.com" \
+  --header "x-metabase-api-key: your_api_key"
+```
+
+Or add it globally (available in all projects):
+
+```bash
+claude mcp add --transport http --scope user metabase "https://your-deployment.example.com/mcp" \
+  --header "x-metabase-url: https://your-metabase-instance.com" \
+  --header "x-metabase-api-key: your_api_key"
+```
+
+### Request Headers
+
+| Header | Required | Description |
+|--------|----------|-------------|
+| `x-metabase-url` | Yes* | Metabase instance URL. Can be omitted if `METABASE_URL` env var is set on the server. |
+| `x-metabase-api-key` | Yes** | Metabase API key |
+| `x-metabase-username` | Yes** | Metabase username (alternative to API key) |
+| `x-metabase-password` | Yes** | Metabase password (required if username is provided) |
+
+\* Falls back to `METABASE_URL` env var if not in header.
+\*\* Either `x-metabase-api-key` OR `x-metabase-username` + `x-metabase-password` is required.
+
+### Username/Password via headers
+
+```bash
+claude mcp add --transport http metabase "https://your-deployment.example.com/mcp" \
+  --header "x-metabase-url: https://your-metabase-instance.com" \
+  --header "x-metabase-username: admin@example.com" \
+  --header "x-metabase-password: secret"
+```
+
+---
+
+## 🔐 OAuth Gateway (Claude.ai Web)
+
+Claude.ai web requires full **OAuth 2.0 Authorization Code + PKCE** to connect to remote MCP servers. The OAuth Gateway handles this flow and proxies requests to the FastMCP HTTP Stream server.
+
+### Architecture
+
+```
+Claude.ai ──→ OAuth Gateway (port 8080)
+              ├── /.well-known/oauth-authorization-server  (discovery)
+              ├── /oauth/authorize  →  login form (Metabase URL + API key)
+              ├── /oauth/token      →  issues signed JWT
+              └── /mcp              →  proxy + inject headers  →  FastMCP (port 8011)
+```
+
+### Starting both servers
+
+```bash
+# Terminal 1 — FastMCP HTTP Stream (internal)
+MCP_TRANSPORT=http PORT=8011 node dist/server.js --all
+
+# Terminal 2 — OAuth Gateway (public-facing)
+GATEWAY_URL=https://your-mcp-server.com \
+GATEWAY_PORT=8080 \
+MCP_UPSTREAM=http://localhost:8011 \
+JWT_SECRET=your-random-secret \
+node dist/oauth-gateway.js
+```
+
+### Environment variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `GATEWAY_URL` | `http://localhost:8080` | Public URL of the gateway (shown in OAuth discovery) |
+| `GATEWAY_PORT` | `8080` | Port to listen on |
+| `MCP_UPSTREAM` | `http://localhost:8011` | Internal FastMCP server URL |
+| `JWT_SECRET` | *(random — changes on restart)* | Secret for signing JWT tokens. **Must be set in production.** |
+| `TOKEN_EXPIRY` | `8h` | JWT expiry (e.g. `1h`, `24h`) |
+
+### Connecting Claude.ai web
+
+1. In Claude.ai, go to **Settings → Integrations → Add MCP server**
+2. Enter: `https://your-mcp-server.com/mcp`
+3. Claude.ai detects the OAuth endpoint automatically and opens the login form
+4. Enter your Metabase URL and API key → click **Conectar**
+5. Claude.ai receives the token and the connection is established
+
+---
+
 ## 🔌 Integration Examples
 
 ### Claude Desktop
@@ -379,6 +487,13 @@ npm install
 ### Build
 ```bash
 npm run build
+```
+
+### Tests
+```bash
+npm test
+# watch mode:
+npm run test:watch
 ```
 
 ### Development Mode
