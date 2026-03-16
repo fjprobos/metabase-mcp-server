@@ -58,6 +58,7 @@ interface PendingCode {
   metabase_api_key?: string;
   metabase_username?: string;
   metabase_password?: string;
+  metabase_session_token?: string;
   code_challenge?: string;   // PKCE
   redirect_uri: string;
   expires: number;
@@ -236,17 +237,30 @@ app.get('/oauth/authorize', (req: Request, res: Response) => {
       <label for="metabase_password">Contraseña</label>
       <input type="password" id="metabase_password" name="metabase_password">
 
-      <p class="error" id="err">Debes ingresar una API Key o usuario + contraseña.</p>
+      <div class="divider">o usa un token de sesión (Google SSO)</div>
+
+      <label for="metabase_session_token">Token de sesión</label>
+      <input type="password" id="metabase_session_token" name="metabase_session_token"
+             placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx">
+      <p style="color:#6b7280;font-size:.75rem;margin-top:.4rem">
+        Si tu Metabase usa Google SSO, inicia sesión en el browser, abre
+        DevTools → Application → Cookies y copia el valor de
+        <code>metabase.SESSION</code>. El token expira según la
+        configuración de tu instancia.
+      </p>
+
+      <p class="error" id="err">Debes ingresar una API Key, usuario + contraseña, o un token de sesión.</p>
 
       <button type="submit">Conectar</button>
     </form>
   </div>
   <script>
     document.getElementById('form').addEventListener('submit', function(e) {
-      var key = document.getElementById('metabase_api_key').value.trim();
-      var user = document.getElementById('metabase_username').value.trim();
-      var pass = document.getElementById('metabase_password').value.trim();
-      if (!key && !(user && pass)) {
+      var key     = document.getElementById('metabase_api_key').value.trim();
+      var user    = document.getElementById('metabase_username').value.trim();
+      var pass    = document.getElementById('metabase_password').value.trim();
+      var session = document.getElementById('metabase_session_token').value.trim();
+      if (!key && !(user && pass) && !session) {
         e.preventDefault();
         document.getElementById('err').classList.add('visible');
       }
@@ -266,6 +280,7 @@ app.post('/oauth/authorize', (req: Request, res: Response) => {
     metabase_api_key,
     metabase_username,
     metabase_password,
+    metabase_session_token,
   } = req.body as Record<string, string>;
 
   if (!redirect_uri) {
@@ -276,18 +291,19 @@ app.post('/oauth/authorize', (req: Request, res: Response) => {
     res.status(400).send('Metabase URL is required');
     return;
   }
-  if (!metabase_api_key && !(metabase_username && metabase_password)) {
-    res.status(400).send('API key or username + password required');
+  if (!metabase_api_key && !(metabase_username && metabase_password) && !metabase_session_token) {
+    res.status(400).send('API key, username + password, or session token required');
     return;
   }
 
   const code = crypto.randomBytes(32).toString('hex');
   pendingCodes.set(code, {
     metabase_url,
-    metabase_api_key:   metabase_api_key   || undefined,
-    metabase_username:  metabase_username  || undefined,
-    metabase_password:  metabase_password  || undefined,
-    code_challenge:     code_challenge_method === 'S256' ? code_challenge : undefined,
+    metabase_api_key:       metabase_api_key       || undefined,
+    metabase_username:      metabase_username      || undefined,
+    metabase_password:      metabase_password      || undefined,
+    metabase_session_token: metabase_session_token || undefined,
+    code_challenge:         code_challenge_method === 'S256' ? code_challenge : undefined,
     redirect_uri,
     expires: Date.now() + 10 * 60 * 1000,
   });
@@ -335,9 +351,10 @@ app.post('/oauth/token', (req: Request, res: Response) => {
   pendingCodes.delete(code);
 
   const payload: Record<string, string> = { metabase_url: pending.metabase_url };
-  if (pending.metabase_api_key)  payload.metabase_api_key  = pending.metabase_api_key;
-  if (pending.metabase_username) payload.metabase_username = pending.metabase_username;
-  if (pending.metabase_password) payload.metabase_password = pending.metabase_password;
+  if (pending.metabase_api_key)       payload.metabase_api_key       = pending.metabase_api_key;
+  if (pending.metabase_username)      payload.metabase_username      = pending.metabase_username;
+  if (pending.metabase_password)      payload.metabase_password      = pending.metabase_password;
+  if (pending.metabase_session_token) payload.metabase_session_token = pending.metabase_session_token;
 
   const token = jwt.sign(payload, JWT_SECRET, { expiresIn: TOKEN_EXPIRY } as jwt.SignOptions);
 
@@ -394,9 +411,10 @@ app.use('/mcp', (req: Request, res: Response) => {
     else if (Array.isArray(v)) proxyHeaders[k] = v[0];
   }
   proxyHeaders['x-metabase-url'] = payload.metabase_url;
-  if (payload.metabase_api_key)  proxyHeaders['x-metabase-api-key']  = payload.metabase_api_key;
-  if (payload.metabase_username) proxyHeaders['x-metabase-username'] = payload.metabase_username;
-  if (payload.metabase_password) proxyHeaders['x-metabase-password'] = payload.metabase_password;
+  if (payload.metabase_api_key)       proxyHeaders['x-metabase-api-key']       = payload.metabase_api_key;
+  if (payload.metabase_username)      proxyHeaders['x-metabase-username']      = payload.metabase_username;
+  if (payload.metabase_password)      proxyHeaders['x-metabase-password']      = payload.metabase_password;
+  if (payload.metabase_session_token) proxyHeaders['x-metabase-session-token'] = payload.metabase_session_token;
   proxyHeaders['host'] = upstream.host;
 
   const isGet = req.method === 'GET';

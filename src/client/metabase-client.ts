@@ -35,6 +35,10 @@ export class MetabaseClient {
       this.logInfo("Using Metabase API Key for authentication.");
       this.axiosInstance.defaults.headers.common["X-API-Key"] = config.apiKey;
       this.sessionToken = "api_key_used";
+    } else if (config.sessionToken) {
+      this.logInfo("Using pre-existing Metabase session token (e.g. Google SSO).");
+      this.axiosInstance.defaults.headers.common["X-Metabase-Session"] = config.sessionToken;
+      this.sessionToken = config.sessionToken;
     } else if (config.username && config.password) {
       this.logInfo("Using Metabase username/password for authentication.");
     } else {

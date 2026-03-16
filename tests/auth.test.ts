@@ -112,6 +112,30 @@ describe('createAuthenticateHandler', () => {
     }
   });
 
+  it('returns a MetabaseClient when x-metabase-session-token is provided (Google SSO)', () => {
+    const result = authenticate({
+      headers: {
+        'x-metabase-url': 'http://metabase.test',
+        'x-metabase-session-token': 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx',
+      },
+    });
+    expect(result.metabaseClient).toBeInstanceOf(MetabaseClient);
+  });
+
+  it('throws a 401 Response when only username is provided without session token either', () => {
+    try {
+      authenticate({
+        headers: {
+          'x-metabase-url': 'http://metabase.test',
+          'x-metabase-username': 'admin@test.com',
+          // no password, no session token
+        },
+      });
+    } catch (e) {
+      expect((e as Response).status).toBe(401);
+    }
+  });
+
   it('each call creates an independent MetabaseClient (session isolation)', () => {
     const r1 = authenticate({
       headers: {

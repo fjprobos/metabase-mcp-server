@@ -35,6 +35,26 @@ describe('MetabaseClient constructor', () => {
     ).toThrow();
   });
 
+  it('initializes successfully with a session token (Google SSO)', () => {
+    expect(
+      () =>
+        new MetabaseClient({
+          url: 'http://metabase.test',
+          sessionToken: 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx',
+        })
+    ).not.toThrow();
+  });
+
+  it('throws when only username is provided without session token either', () => {
+    expect(
+      () =>
+        new MetabaseClient({
+          url: 'http://metabase.test',
+          username: 'user@test.com',
+        })
+    ).toThrow();
+  });
+
   it('creates distinct instances for different configs (no shared state)', () => {
     const clientA = new MetabaseClient({ url: 'http://a.test', apiKey: 'key-a' });
     const clientB = new MetabaseClient({ url: 'http://b.test', apiKey: 'key-b' });

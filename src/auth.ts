@@ -11,6 +11,7 @@ export function createAuthenticateHandler() {
     const apiKey = request.headers['x-metabase-api-key'] as string;
     const username = request.headers['x-metabase-username'] as string;
     const password = request.headers['x-metabase-password'] as string;
+    const sessionToken = request.headers['x-metabase-session-token'] as string;
 
     if (!url) {
       throw new Response(null, {
@@ -18,14 +19,14 @@ export function createAuthenticateHandler() {
         statusText: 'Missing Metabase URL: provide x-metabase-url header or METABASE_URL env var',
       });
     }
-    if (!apiKey && (!username || !password)) {
+    if (!apiKey && (!username || !password) && !sessionToken) {
       throw new Response(null, {
         status: 401,
-        statusText: 'Missing credentials: provide x-metabase-api-key or x-metabase-username + x-metabase-password headers',
+        statusText: 'Missing credentials: provide x-metabase-api-key, x-metabase-username + x-metabase-password, or x-metabase-session-token headers',
       });
     }
 
-    const metabaseClient = new MetabaseClient({ url, apiKey, username, password });
+    const metabaseClient = new MetabaseClient({ url, apiKey, username, password, sessionToken });
     return { metabaseClient };
   };
 }
