@@ -274,6 +274,17 @@ app.get('/oauth/authorize', (req: Request, res: Response) => {
     .sso-status { font-size: .78rem; margin-top: .5rem; color: #6b7280; min-height: 1.2em; }
     .sso-status.ok  { color: #16a34a; }
     .sso-status.err { color: #dc2626; }
+    .btn-toggle {
+      display: flex; align-items: center; gap: .4rem;
+      background: none; border: none; padding: 0;
+      color: #6b7280; font-size: .8rem; cursor: pointer;
+      margin-top: 1.25rem;
+    }
+    .btn-toggle:hover { color: #374151; }
+    .btn-toggle svg { transition: transform .2s; }
+    .btn-toggle.open svg { transform: rotate(180deg); }
+    .advanced { display: none; }
+    .advanced.open { display: block; }
   </style>
 </head>
 <body>
@@ -298,29 +309,36 @@ app.get('/oauth/authorize', (req: Request, res: Response) => {
       </button>
       <p class="sso-status" id="sso-status"></p>
 
-      <div class="divider">o usa API Key</div>
+      <button type="button" class="btn-toggle" id="btn-toggle" onclick="toggleAdvanced()">
+        <svg width="14" height="14" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M5.293 7.293a1 1 0 011.414 0L10 10.586l3.293-3.293a1 1 0 111.414 1.414l-4 4a1 1 0 01-1.414 0l-4-4a1 1 0 010-1.414z" clip-rule="evenodd"/></svg>
+        Otras opciones de autenticación
+      </button>
 
-      <label for="metabase_api_key">API Key</label>
-      <input type="password" id="metabase_api_key" name="metabase_api_key"
-             placeholder="mb_xxxxxxxx">
+      <div class="advanced" id="advanced">
+        <div class="divider">API Key</div>
 
-      <div class="divider">o usuario y contraseña</div>
+        <label for="metabase_api_key">API Key</label>
+        <input type="password" id="metabase_api_key" name="metabase_api_key"
+               placeholder="mb_xxxxxxxx">
 
-      <label for="metabase_username">Usuario</label>
-      <input type="text" id="metabase_username" name="metabase_username"
-             placeholder="admin@example.com">
+        <div class="divider">usuario y contraseña</div>
 
-      <label for="metabase_password">Contraseña</label>
-      <input type="password" id="metabase_password" name="metabase_password">
+        <label for="metabase_username">Usuario</label>
+        <input type="text" id="metabase_username" name="metabase_username"
+               placeholder="admin@example.com">
 
-      <div class="divider">o pega el token manualmente</div>
+        <label for="metabase_password">Contraseña</label>
+        <input type="password" id="metabase_password" name="metabase_password">
 
-      <label for="metabase_session_token">Token de sesión</label>
-      <input type="password" id="metabase_session_token" name="metabase_session_token"
-             placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx">
-      <p style="color:#6b7280;font-size:.75rem;margin-top:.4rem">
-        DevTools → Application → Cookies → <code>metabase.SESSION</code>
-      </p>
+        <div class="divider">token de sesión manual</div>
+
+        <label for="metabase_session_token">Token de sesión</label>
+        <input type="password" id="metabase_session_token" name="metabase_session_token"
+               placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx">
+        <p style="color:#6b7280;font-size:.75rem;margin-top:.4rem">
+          DevTools → Application → Cookies → <code>metabase.SESSION</code>
+        </p>
+      </div>
 
       <p class="error" id="err">Debes ingresar una API Key, usuario + contraseña, o un token de sesión.</p>
 
@@ -328,6 +346,14 @@ app.get('/oauth/authorize', (req: Request, res: Response) => {
     </form>
   </div>
   <script>
+    // ── Advanced toggle ───────────────────────────────────────────────────────
+    function toggleAdvanced() {
+      var adv = document.getElementById('advanced');
+      var btn = document.getElementById('btn-toggle');
+      var open = adv.classList.toggle('open');
+      btn.classList.toggle('open', open);
+    }
+
     // ── Form validation ───────────────────────────────────────────────────────
     document.getElementById('form').addEventListener('submit', function(e) {
       var key     = document.getElementById('metabase_api_key').value.trim();
