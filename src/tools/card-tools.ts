@@ -82,25 +82,38 @@ export function addCardTools(server: any, getClient: (ctx?: any) => MetabaseClie
    */
   server.addTool({
     name: "create_card",
-    description: "Create a new Metabase card with custom query, visualization type, and settings - use this to programmatically build new analytical cards, dashboards charts, or data exploration queries",
-    metadata: { isWrite: true },
+    description: "Create a new Metabase card (saved question) with a native SQL query. Provide the SQL query string and database_id, and the tool builds the correct payload automatically.",
+    metadata: { isWrite: true, isEssential: true },
     parameters: z.object({
       name: z.string().describe("Card name"),
-      description: z.string().optional().describe("Description"),
-      dataset_query: z.unknown().optional().describe("Dataset query object - fully preserved including nested MBQL arrays"),
-      display: z.string().optional().describe("Visualization type"),
+      database_id: z.number().describe("Database ID to run the query against"),
+      query: z.string().describe("Native SQL query string (e.g. 'SELECT * FROM orders LIMIT 10')"),
+      description: z.string().optional().describe("Card description"),
+      collection_id: z.number().optional().describe("Collection ID to save the card in"),
+      display: z.string().optional().describe("Visualization type: table, bar, line, pie, scalar, etc. Defaults to 'table'"),
       visualization_settings: z
         .object({})
         .passthrough()
         .optional()
-        .describe("Visualization settings"),
-      collection_id: z.number().optional().describe("Collection to save in"),
-      database_id: z.number().optional().describe("Database ID"),
-    }).strict(),
+        .describe("Visualization settings object"),
+    }),
     execute: async (args: any, context: any) => {
       const metabaseClient = getClient(context);
       try {
-        const card = await metabaseClient.createCard(args);
+        const payload: any = {
+          name: args.name,
+          dataset_query: {
+            database: args.database_id,
+            type: "native",
+            native: { query: args.query },
+          },
+          display: args.display || "table",
+          visualization_settings: args.visualization_settings || {},
+        };
+        if (args.description) payload.description = args.description;
+        if (args.collection_id != null) payload.collection_id = args.collection_id;
+
+        const card = await metabaseClient.createCard(payload);
         return JSON.stringify(card, null, 2);
       } catch (error) {
         throw new Error(
@@ -125,7 +138,7 @@ export function addCardTools(server: any, getClient: (ctx?: any) => MetabaseClie
   server.addTool({
     name: "update_card",
     description: "Modify an existing Metabase card's name, description, query definition, visualization type, or settings - use this to fix broken cards, change chart types, update queries, or move cards between collections",
-    metadata: { isWrite: true },
+    metadata: { isWrite: true, isEssential: true },
     parameters: z.object({
       card_id: z.number().describe("Card ID"),
       updates: z.object({}).passthrough().describe("Fields to update"),
@@ -308,7 +321,7 @@ export function addCardTools(server: any, getClient: (ctx?: any) => MetabaseClie
   server.addTool({
     name: "copy_card",
     description: "Create a duplicate copy of an existing Metabase card with identical query and settings - use this to create variations of existing cards, build templates for similar analyses, or backup important queries before modifications",
-    metadata: { isWrite: true },
+    metadata: { isWrite: true, isEssential: true },
     parameters: z.object({
       card_id: z.number().describe("Card ID"),
     }).strict(),

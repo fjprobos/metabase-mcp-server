@@ -401,7 +401,7 @@ export function addDashboardTools(server: any, getClient: (ctx?: any) => Metabas
     name: "add_card_to_dashboard",
     description:
       "Add an existing card to a dashboard with optional parameter mappings - use this to build comprehensive dashboards by combining multiple visualizations",
-    metadata: { isWrite: true },
+    metadata: { isWrite: true, isEssential: true },
     parameters: z.object({
       dashboard_id: z.number().describe("The ID of the dashboard"),
       cardId: z
