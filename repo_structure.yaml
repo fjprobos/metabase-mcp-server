@@ -1,0 +1,58 @@
+schema_version: "1.0"
+
+identity:
+  name: metabase-mcp-server
+  description: >
+    Servidor MCP (Model Context Protocol) en TypeScript que expone 80+ herramientas
+    para operar Metabase (dashboards, cards, databases, tables) desde asistentes de
+    IA. Fork de madeofclay sobre el paquete open-source CognitionAI/metabase-mcp-server,
+    con un gateway OAuth propio (src/oauth-gateway.ts) agregado para autenticar
+    clientes MCP remotos (ej. Claude.ai) contra Metabase sin compartir credenciales.
+  team: "clay-data"
+  language: typescript
+  environments: [prod, develop]
+
+infrastructure:
+  runtime: node20
+  hosting: self-hosted (no evidencia de despliegue AWS en este repo — ver agent_notes)
+  region: "N/A - sin IaC en el repo"
+  iac: none
+  deploy_strategy: npm-publish
+  deploy_branch: main
+
+entrypoints:
+  # No hay API Gateway/Lambda/EKS declarado en este repo. El servidor se distribuye
+  # como paquete npm (`@cognitionai/metabase-mcp-server`) y se ejecuta:
+  #  - vía stdio (proceso local, un proceso por usuario), o
+  #  - vía HTTP Stream (src/server.ts, puerto 8011 por defecto) para despliegue compartido
+  # No hay ARN ni dominio propio de Clay declarado en el código para ninguno de los dos modos.
+  - type: mcp-stdio
+    description: "Modo stdio: build/dist/server.js, un proceso local por usuario (Claude Desktop, Cursor, etc.)"
+    environments: [prod, develop]
+    custom_domain: ~
+  - type: http-stream
+    description: "Modo HTTP Stream opcional (MCP_TRANSPORT=http), puerto 8011, mismo binario server.ts. Sin evidencia de despliegue real (sin IaC, sin workflow de deploy)."
+    environments: [prod, develop]
+    custom_domain: ~
+  - type: oauth-gateway
+    description: "Gateway Express opcional (src/oauth-gateway.ts, GATEWAY_PORT 8080 por defecto) que implementa Authorization Code + PKCE para clientes OAuth (Claude.ai) y proxea a http-stream. Referencia hardcodeada a https://analytics.clay.cl/ como valor por defecto del formulario, confirmando uso real de Clay, pero sin manifiesto de despliegue en el repo."
+    environments: [prod, develop]
+    custom_domain: ~
+
+dependencies:
+  external_apis:
+    - name: metabase
+      description: "Instancia Metabase objetivo (ej. analytics.clay.cl), configurable vía METABASE_URL / header x-metabase-url"
+
+owners:
+  team: "clay-data"
+  contact: ~
+  github_org: madeofclay
+
+agent_notes:
+  - "GAP: este repo fue pre-clasificado como 'con infraestructura real desplegada' (Terraform/GH Actions build-deploy/SAM/K8s), pero la exploración completa (Fase 1) NO encontró terraform/*.tf, k8s/ ni kubernetes/, template.yaml, serverless.yml ni cdk.json en ningún lado del árbol. El único workflow de GitHub Actions (.github/workflows/publish.yml) publica el paquete a npm (registro público, bajo el scope @cognitionai, no madeofclay) al hacer push a main — no hay CD hacia AWS ni ECS/EKS/Lambda."
+  - "GAP: no hay account ID, ARN, ni región de AWS resoluble desde el código — no se ejecutó ningún comando aws CLI porque no había ningún recurso candidato a resolver (nada en el código apunta a un ARN/nombre de recurso AWS real)."
+  - "El repo es un fork del proyecto open-source CognitionAI/metabase-mcp-server (remote 'upstream' presente tras el clone). El README, package.json (scope @cognitionai) y la mayoría del código son idénticos al upstream; la única personalización visible de Clay es el gateway OAuth (src/oauth-gateway.ts, agregado en commits recientes de la rama main de madeofclay) con el default 'https://analytics.clay.cl/' en el formulario de autorización."
+  - "Si Clay efectivamente corre este servidor en producción (ej. como contenedor Docker en alguna instancia/servicio para exponer el gateway OAuth a Claude.ai), la infraestructura que lo aloja vive fuera de este repositorio (otro repo de infra, o desplegado manualmente) — recomendar confirmarlo con el equipo dueño antes de asumir 'sin infraestructura'."
+  - "Dockerfile tiene un mismatch: CMD ejecuta 'node dist/index.js', pero el build (npm run build) y package.json.main apuntan a 'dist/server.js' / 'build/server.js' — el contenedor tal como está definido probablemente falla al arrancar. No se corrigió (fuera de alcance de este levantamiento de documentación)."
+  - "No hay bases de datos, colas SQS/SNS, buckets S3, ni tablas DynamoDB propias de este repo — toda la 'persistencia' vive dentro de la instancia Metabase externa (fuera del alcance de este repo) y, en el gateway OAuth, un Map en memoria de códigos de autorización pendientes (TTL 10 min, se pierde al reiniciar el proceso)."
