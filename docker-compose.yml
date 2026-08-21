@@ -10,11 +10,20 @@ services:
       
       # Option 1: Use API Key (recommended)
       - METABASE_API_KEY=your_metabase_api_key
-      
+
       # Option 2: Use Username/Password (if API key not available)
       # - METABASE_USERNAME=your_username
       # - METABASE_PASSWORD=your_password
-      
+
+      # Preferred for production: leave METABASE_API_KEY unset and let the
+      # server read it from Clay's Secrets Manager vaults (POL-SEC-001), where
+      # it lives under the METABASE_MCP_KEY key. Needs an IAM role with
+      # secretsmanager:GetSecretValue on clay-common-secrets-{env} and
+      # clay-{team}-secrets-{env}.
+      # - APP_ENV=development     # development | production
+      # - CLAY_TEAM=data          # -> clay-data-secrets-development
+      # - AWS_REGION=us-east-1
+
       # Optional: Set log level
       - LOG_LEVEL=info
       

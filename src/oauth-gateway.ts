@@ -17,7 +17,7 @@
  *   GATEWAY_URL     Public base URL of this gateway  (e.g. https://mcp.example.com)
  *   GATEWAY_PORT    Port to listen on                (default: 8080)
  *   MCP_UPSTREAM    FastMCP HTTP Stream URL           (default: http://localhost:8011)
- *   JWT_SECRET      Secret for signing tokens        (auto-generated if absent — don't use auto in prod)
+ *   JWT_SECRET      Secret for signing tokens        (required — env var or vault)
  *   TOKEN_EXPIRY    JWT expiry                       (default: 8h)
  */
 
@@ -26,6 +26,7 @@ import http from 'http';
 import { URL } from 'url';
 import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
+import { hydrateEnvFromVault, vaultName } from './utils/secrets.js';
 
 const LOG_LEVEL = (process.env.LOG_LEVEL || 'info').toLowerCase();
 
@@ -46,10 +47,18 @@ const GATEWAY_PORT = parseInt(process.env.GATEWAY_PORT || '8080');
 const MCP_UPSTREAM = (process.env.MCP_UPSTREAM  || 'http://localhost:8011').replace(/\/$/, '');
 const TOKEN_EXPIRY = process.env.TOKEN_EXPIRY   || '8h';
 
+// Resolves JWT_SECRET from Clay's Secrets Manager vaults (POL-SEC-001)
+// unless it is already present in the environment.
+const secretOrigin = await hydrateEnvFromVault({ JWT_SECRET: 'METABASE_MCP_GATEWAY_SECRET' });
+
 if (!process.env.JWT_SECRET) {
-  log('warn', 'JWT_SECRET is not set — using a random secret that will change on restart. Set JWT_SECRET in production.');
+  throw new Error(
+    'JWT_SECRET is required. Set the JWT_SECRET environment variable, or register ' +
+    `METABASE_MCP_GATEWAY_SECRET in ${vaultName()}.`
+  );
 }
-const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(32).toString('hex');
+const JWT_SECRET = process.env.JWT_SECRET;
+log('info', `JWT_SECRET loaded from ${secretOrigin.JWT_SECRET}`);
 
 // ── Pending authorization codes (in-memory, 10-min TTL) ─────────────────────
 
@@ -551,11 +560,12 @@ app.post('/oauth/token', (req: Request, res: Response) => {
   if (pending.metabase_session_token) payload.metabase_session_token = pending.metabase_session_token;
 
   const token = jwt.sign(payload, JWT_SECRET, { expiresIn: TOKEN_EXPIRY } as jwt.SignOptions);
+  const { iat, exp } = jwt.decode(token) as { iat: number; exp: number };
 
   res.json({
     access_token: token,
     token_type: 'bearer',
-    expires_in: 8 * 60 * 60,
+    expires_in: exp - iat,
   });
 });
 

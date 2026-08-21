@@ -192,8 +192,47 @@ node dist/oauth-gateway.js
 | `GATEWAY_URL` | `http://localhost:8080` | Public URL of the gateway (shown in OAuth discovery) |
 | `GATEWAY_PORT` | `8080` | Port to listen on |
 | `MCP_UPSTREAM` | `http://localhost:8011` | Internal FastMCP server URL |
-| `JWT_SECRET` | *(random — changes on restart)* | Secret for signing JWT tokens. **Must be set in production.** |
+| `JWT_SECRET` | *(required)* | Secret for signing JWT tokens. The gateway fails to start without it. |
 | `TOKEN_EXPIRY` | `8h` | JWT expiry (e.g. `1h`, `24h`) |
+
+#### Loading secrets from AWS Secrets Manager
+
+`METABASE_API_KEY` (stdio mode) and `JWT_SECRET` (OAuth gateway) are resolved
+at startup from Clay's Secrets Manager vaults, per POL-SEC-001:
+
+| Vault | Contents |
+| --- | --- |
+| `clay-common-secrets-{env}` | shared across teams (optional) |
+| `clay-{team}-secrets-{env}` | owned by the team (required) |
+
+The common vault is read first and the team vault layers on top. `APP_ENV`
+selects the environment (`development` or `production`) and `CLAY_TEAM` the
+team (default `data`). Credentials come from the process's IAM role, which
+needs `secretsmanager:GetSecretValue` on those vaults. Values are held in
+memory only — never written to disk, never logged.
+
+| Env var | Vault key |
+| --- | --- |
+| `METABASE_API_KEY` | `METABASE_MCP_KEY` |
+| `METABASE_USERNAME` | `METABASE_MCP_USERNAME` |
+| `METABASE_PASSWORD` | `METABASE_MCP_PASSWORD` |
+| `JWT_SECRET` | `METABASE_MCP_GATEWAY_SECRET` |
+
+An env var that is already set wins over the vault, and when every variable
+is set AWS is never called — that is how local development runs with no AWS
+access at all:
+
+```bash
+APP_ENV=development CLAY_TEAM=data AWS_REGION=us-east-1 node dist/oauth-gateway.js
+```
+
+Vault contents are managed by the DevOps team: adding a key is a request,
+not a self-service operation.
+
+This deployment authenticates with the API key; the username/password pair is
+only a fallback for `loadConfig()`. A key absent from the vault is left
+undefined, so a partially populated vault is fine — today the vaults hold only
+`METABASE_MCP_KEY` and `METABASE_MCP_GATEWAY_SECRET`.
 
 ### Connecting Claude.ai web
 
