@@ -22,6 +22,8 @@
  *   JWT_SECRET             Secret for signing tokens        (required — env var or vault)
  *   TOKEN_EXPIRY           Access token expiry              (default: 8h)
  *   REFRESH_TOKEN_EXPIRY   Refresh token expiry             (default: 30d)
+ *   MCP_RESOURCE_URI       Public URI of the MCP endpoint   (default: GATEWAY_URL/mcp)
+ *                          Set this when a proxy exposes /mcp under a path prefix.
  */
 
 import express, { Request, Response, NextFunction } from 'express';
@@ -54,7 +56,12 @@ const REFRESH_TOKEN_EXPIRY = process.env.REFRESH_TOKEN_EXPIRY || '30d';
 // Canonical URI of the MCP server this gateway protects (RFC 8707 / RFC 9728).
 // Access tokens are bound to it so a token minted for another resource cannot be
 // replayed here, which MCP requires resource servers to enforce.
-const RESOURCE_URI = `${GATEWAY_URL}/mcp`;
+//
+// This is NOT always `${GATEWAY_URL}/mcp`: a reverse proxy may expose the server
+// under a path prefix it strips before the gateway sees the request, so the
+// gateway cannot infer its own public URI. It must be told.
+const RESOURCE_URI = (process.env.MCP_RESOURCE_URI || `${GATEWAY_URL}/mcp`).replace(/\/$/, '');
+const RESOURCE_PATH = new URL(RESOURCE_URI).pathname;
 
 // Resolves JWT_SECRET from Clay's Secrets Manager vaults (POL-SEC-001)
 // unless it is already present in the environment.
@@ -206,7 +213,9 @@ const protectedResourceMetadata = (_req: Request, res: Response) => {
 };
 
 app.get('/.well-known/oauth-protected-resource', protectedResourceMetadata);
-app.get('/.well-known/oauth-protected-resource/mcp', protectedResourceMetadata);
+if (RESOURCE_PATH !== '/') {
+  app.get(`/.well-known/oauth-protected-resource${RESOURCE_PATH}`, protectedResourceMetadata);
+}
 
 app.get('/.well-known/oauth-authorization-server', (_req: Request, res: Response) => {
   res.json({

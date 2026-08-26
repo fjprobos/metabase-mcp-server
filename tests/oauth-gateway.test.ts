@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import request from 'supertest';
 import jwt from 'jsonwebtoken';
 
@@ -260,6 +260,19 @@ describe('GET /.well-known/oauth-protected-resource', () => {
     const res = await request(app).get('/.well-known/oauth-protected-resource/mcp');
     expect(res.status).toBe(200);
     expect(res.body.resource).toBe('https://mcp.example.com/mcp');
+  });
+
+  it('derives that path from the resource, not a hardcoded /mcp', async () => {
+    // A proxy may expose the server under a prefix it strips, so the well-known
+    // path RFC 9728 constructs is not always /.well-known/...-resource/mcp.
+    process.env.MCP_RESOURCE_URI = 'https://mcp.example.com/prefixed/mcp';
+    vi.resetModules();
+    const { app: prefixed } = await import('../src/oauth-gateway.js?prefixed');
+    delete process.env.MCP_RESOURCE_URI;
+
+    const res = await request(prefixed).get('/.well-known/oauth-protected-resource/prefixed/mcp');
+    expect(res.status).toBe(200);
+    expect(res.body.resource).toBe('https://mcp.example.com/prefixed/mcp');
   });
 });
 
