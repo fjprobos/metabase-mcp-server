@@ -311,6 +311,42 @@ describe('POST /mcp - authentication', () => {
       .send({ jsonrpc: '2.0', method: 'tools/list', id: 1 });
     expect(res.status).toBe(401);
   });
+
+  it('distinguishes an expired token from an invalid one', async () => {
+    const expired = jwt.sign(
+      { metabase_url: 'https://metabase.example.com' },
+      'test-secret-for-vitest',
+      { expiresIn: '-1s' },
+    );
+    const res = await request(app)
+      .post('/mcp')
+      .set('Authorization', `Bearer ${expired}`)
+      .send({ jsonrpc: '2.0', method: 'tools/list', id: 1 });
+    expect(res.status).toBe(401);
+    expect(res.body.error_description).toBe('Token expired');
+
+    const bad = await request(app)
+      .post('/mcp')
+      .set('Authorization', 'Bearer not.a.jwt')
+      .send({ jsonrpc: '2.0', method: 'tools/list', id: 1 });
+    expect(bad.body.error_description).toBe('Token invalid');
+  });
+
+  it('sends a WWW-Authenticate challenge so the client knows to renew', async () => {
+    const expired = jwt.sign(
+      { metabase_url: 'https://metabase.example.com' },
+      'test-secret-for-vitest',
+      { expiresIn: '-1s' },
+    );
+    const res = await request(app)
+      .post('/mcp')
+      .set('Authorization', `Bearer ${expired}`)
+      .send({ jsonrpc: '2.0', method: 'tools/list', id: 1 });
+    expect(res.headers['www-authenticate']).toContain('error="invalid_token"');
+
+    const none = await request(app).post('/mcp').send({ jsonrpc: '2.0', method: 'tools/list', id: 1 });
+    expect(none.headers['www-authenticate']).toContain('Bearer realm=');
+  });
 });
 
 // ── Health ────────────────────────────────────────────────────────────────────

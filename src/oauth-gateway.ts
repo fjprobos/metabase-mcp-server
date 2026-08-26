@@ -579,12 +579,26 @@ app.use('/mcp', (req: Request, res: Response) => {
   const start = Date.now();
   const session = (req.headers['mcp-session-id'] as string || '').slice(0, 8) || '-';
   const method = (req.body as any)?.method || '-';
+
+  // Populated by the auth checks below so the access log can say *why* a request
+  // was rejected — an absent header and an expired token are different problems.
+  let denial = '';
+  let denialDetail = '';
+
   res.on('finish', () => {
-    log('info', `${req.method} /mcp session=${session} method=${method} status=${res.statusCode} ms=${Date.now() - start}`);
+    const why = denial ? ` reason=${denial}${denialDetail}` : '';
+    log('info', `${req.method} /mcp session=${session} method=${method} status=${res.statusCode} ms=${Date.now() - start}${why}`);
   });
+
+  // Tells the client this is an authentication problem it can recover from,
+  // rather than an opaque failure. Required by RFC 6750.
+  const challenge = (error: string, description: string) =>
+    res.setHeader('WWW-Authenticate', `Bearer realm="${GATEWAY_URL}", error="${error}", error_description="${description}"`);
 
   const auth = req.headers['authorization'] as string | undefined;
   if (!auth?.startsWith('Bearer ')) {
+    denial = 'missing_bearer';
+    challenge('invalid_request', 'Bearer token required');
     res.status(401).json({ error: 'Bearer token required' });
     return;
   }
@@ -592,8 +606,17 @@ app.use('/mcp', (req: Request, res: Response) => {
   let payload: Record<string, string>;
   try {
     payload = jwt.verify(auth.slice(7), JWT_SECRET) as Record<string, string>;
-  } catch {
-    res.status(401).json({ error: 'invalid_token', error_description: 'Token invalid or expired' });
+  } catch (err) {
+    if (err instanceof jwt.TokenExpiredError) {
+      denial = 'token_expired';
+      denialDetail = ` expired_at=${err.expiredAt.toISOString()}`;
+      challenge('invalid_token', 'Token expired');
+      res.status(401).json({ error: 'invalid_token', error_description: 'Token expired' });
+    } else {
+      denial = 'token_invalid';
+      challenge('invalid_token', 'Token invalid');
+      res.status(401).json({ error: 'invalid_token', error_description: 'Token invalid' });
+    }
     return;
   }
 
