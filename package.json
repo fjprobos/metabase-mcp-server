@@ -50,6 +50,7 @@
     "test:watch": "vitest"
   },
   "dependencies": {
+    "@aws-sdk/client-secrets-manager": "^3.967.0",
     "@modelcontextprotocol/sdk": "^0.6.1",
     "abort-controller": "^3.0.0",
     "axios": "^1.8.2",

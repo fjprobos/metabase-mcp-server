@@ -20,6 +20,7 @@ export class MetabaseClient {
   private axiosInstance: AxiosInstance;
   private sessionToken: string | null = null;
   private config: MetabaseConfig;
+  private authMode: 'api_key' | 'session_token' | 'password' = 'password';
 
   constructor(config: MetabaseConfig) {
     this.config = config;
@@ -32,10 +33,12 @@ export class MetabaseClient {
     });
 
     if (config.apiKey) {
+      this.authMode = 'api_key';
       this.logInfo("Using Metabase API Key for authentication.");
       this.axiosInstance.defaults.headers.common["X-API-Key"] = config.apiKey;
       this.sessionToken = "api_key_used";
     } else if (config.sessionToken) {
+      this.authMode = 'session_token';
       this.logInfo("Using pre-existing Metabase session token (e.g. Google SSO).");
       this.axiosInstance.defaults.headers.common["X-Metabase-Session"] = config.sessionToken;
       this.sessionToken = config.sessionToken;
@@ -68,6 +71,42 @@ export class MetabaseClient {
       }
     );
 
+    // Every Metabase failure funnels through here. Without it the server logged
+    // nothing above `info`, so a credential Metabase had stopped accepting was
+    // invisible on this side: the tool error travels inside an HTTP 200 to the
+    // client, and the only trace left here was a successful-looking request.
+    this.axiosInstance.interceptors.response.use(
+      (response) => response,
+      (error) => {
+        const status = error?.response?.status;
+        if (status) {
+          this.logUpstream(
+            status === 401 || status === 403 ? 'error' : 'warn',
+            `Metabase returned ${status} for ${error?.config?.method?.toUpperCase() || '?'} ${error?.config?.url || '?'}`,
+            status,
+          );
+        }
+        return Promise.reject(error);
+      }
+    );
+
+  }
+
+  /**
+   * Records an upstream failure with the credential kind that produced it, so a
+   * report of "it returns 401" can be traced to which auth path is failing.
+   * The credential itself is never logged — only which of the three was used.
+   */
+  private logUpstream(level: 'warn' | 'error', message: string, status: number) {
+    const entry = {
+      timestamp: new Date().toISOString(),
+      level,
+      message,
+      status,
+      auth_mode: this.authMode,
+    };
+    console.error(JSON.stringify(entry));
+    console.error(`${level.toUpperCase()}: ${message} (auth_mode=${this.authMode})`);
   }
 
   private logInfo(message: string, data?: unknown) {

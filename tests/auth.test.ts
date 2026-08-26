@@ -52,7 +52,7 @@ describe('createAuthenticateHandler', () => {
     const result = authenticate({
       headers: {
         'x-metabase-url': 'http://metabase.test',
-        'x-metabase-api-key': 'test-api-key',
+        'x-metabase-api-key': 'mb_testapikey123',
       },
     });
     expect(result.metabaseClient).toBeInstanceOf(MetabaseClient);
@@ -72,18 +72,18 @@ describe('createAuthenticateHandler', () => {
   it('falls back to METABASE_URL env var when x-metabase-url header is absent', () => {
     process.env.METABASE_URL = 'http://env-metabase.test';
     const result = authenticate({
-      headers: { 'x-metabase-api-key': 'test-api-key' },
+      headers: { 'x-metabase-api-key': 'mb_testapikey123' },
     });
     expect(result.metabaseClient).toBeInstanceOf(MetabaseClient);
   });
 
   it('throws a 401 Response when URL is missing and METABASE_URL is not set', () => {
     expect(() =>
-      authenticate({ headers: { 'x-metabase-api-key': 'key' } })
+      authenticate({ headers: { 'x-metabase-api-key': 'mb_key12345678' } })
     ).toThrow(Response);
 
     try {
-      authenticate({ headers: { 'x-metabase-api-key': 'key' } });
+      authenticate({ headers: { 'x-metabase-api-key': 'mb_key12345678' } });
     } catch (e) {
       expect((e as Response).status).toBe(401);
       expect((e as Response).statusText).toMatch(/Missing Metabase URL/);
@@ -136,17 +136,54 @@ describe('createAuthenticateHandler', () => {
     }
   });
 
+  it('ignores a malformed API key and uses the session token instead', () => {
+    // A password manager fills the OAuth form's first type=password field, so a
+    // request can carry a saved password where an API key belongs. The key
+    // outranks everything else, so honouring it would waste a good session.
+    const handler = createAuthenticateHandler();
+    const { metabaseClient } = handler({
+      headers: {
+        'x-metabase-url': 'https://metabase.example.com',
+        'x-metabase-api-key': 'my-saved-google-password',
+        'x-metabase-session-token': 'a-real-session-uuid',
+      },
+    });
+    expect((metabaseClient as any).authMode).toBe('session_token');
+  });
+
+  it('still honours a well-formed API key', () => {
+    const handler = createAuthenticateHandler();
+    const { metabaseClient } = handler({
+      headers: {
+        'x-metabase-url': 'https://metabase.example.com',
+        'x-metabase-api-key': 'mb_realkey12345',
+        'x-metabase-session-token': 'a-real-session-uuid',
+      },
+    });
+    expect((metabaseClient as any).authMode).toBe('api_key');
+  });
+
+  it('throws a 401 when the malformed key was the only credential', () => {
+    const handler = createAuthenticateHandler();
+    expect(() => handler({
+      headers: {
+        'x-metabase-url': 'https://metabase.example.com',
+        'x-metabase-api-key': 'not-a-key',
+      },
+    })).toThrow();
+  });
+
   it('each call creates an independent MetabaseClient (session isolation)', () => {
     const r1 = authenticate({
       headers: {
         'x-metabase-url': 'http://metabase-a.test',
-        'x-metabase-api-key': 'key-a',
+        'x-metabase-api-key': 'mb_key_a12345',
       },
     });
     const r2 = authenticate({
       headers: {
         'x-metabase-url': 'http://metabase-b.test',
-        'x-metabase-api-key': 'key-b',
+        'x-metabase-api-key': 'mb_key_b12345',
       },
     });
     expect(r1.metabaseClient).not.toBe(r2.metabaseClient);

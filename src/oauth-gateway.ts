@@ -9,16 +9,21 @@
  *   1. Claude.ai discovers /oauth/authorize via /.well-known/oauth-authorization-server
  *   2. Claude.ai redirects user to /oauth/authorize  →  HTML form (Metabase URL + key)
  *   3. User submits  →  server stores creds under a temp code  →  redirect back to client
- *   4. Claude.ai POSTs /oauth/token with code  →  server returns signed JWT
+ *   4. Claude.ai POSTs /oauth/token with code  →  server returns access + refresh JWT
  *   5. Claude.ai calls /mcp with  Authorization: Bearer <JWT>
  *   6. Gateway validates JWT, injects x-metabase-* headers, proxies to FastMCP
+ *   7. When the access token expires, Claude.ai POSTs /oauth/token with
+ *      grant_type=refresh_token  →  server returns a fresh pair (rotation)
  *
  * Environment variables:
- *   GATEWAY_URL     Public base URL of this gateway  (e.g. https://mcp.example.com)
- *   GATEWAY_PORT    Port to listen on                (default: 8080)
- *   MCP_UPSTREAM    FastMCP HTTP Stream URL           (default: http://localhost:8011)
- *   JWT_SECRET      Secret for signing tokens        (auto-generated if absent — don't use auto in prod)
- *   TOKEN_EXPIRY    JWT expiry                       (default: 8h)
+ *   GATEWAY_URL            Public base URL of this gateway  (e.g. https://mcp.example.com)
+ *   GATEWAY_PORT           Port to listen on                (default: 8080)
+ *   MCP_UPSTREAM           FastMCP HTTP Stream URL          (default: http://localhost:8011)
+ *   JWT_SECRET             Secret for signing tokens        (required — env var or vault)
+ *   TOKEN_EXPIRY           Access token expiry              (default: 8h)
+ *   REFRESH_TOKEN_EXPIRY   Refresh token expiry             (default: 30d)
+ *   MCP_RESOURCE_URI       Public URI of the MCP endpoint   (default: GATEWAY_URL/mcp)
+ *                          Set this when a proxy exposes /mcp under a path prefix.
  */
 
 import express, { Request, Response, NextFunction } from 'express';
@@ -26,6 +31,7 @@ import http from 'http';
 import { URL } from 'url';
 import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
+import { hydrateEnvFromVault, vaultName } from './utils/secrets.js';
 
 const LOG_LEVEL = (process.env.LOG_LEVEL || 'info').toLowerCase();
 
@@ -45,11 +51,30 @@ const GATEWAY_URL  = (process.env.GATEWAY_URL  || 'http://localhost:8080').repla
 const GATEWAY_PORT = parseInt(process.env.GATEWAY_PORT || '8080');
 const MCP_UPSTREAM = (process.env.MCP_UPSTREAM  || 'http://localhost:8011').replace(/\/$/, '');
 const TOKEN_EXPIRY = process.env.TOKEN_EXPIRY   || '8h';
+const REFRESH_TOKEN_EXPIRY = process.env.REFRESH_TOKEN_EXPIRY || '30d';
+
+// Canonical URI of the MCP server this gateway protects (RFC 8707 / RFC 9728).
+// Access tokens are bound to it so a token minted for another resource cannot be
+// replayed here, which MCP requires resource servers to enforce.
+//
+// This is NOT always `${GATEWAY_URL}/mcp`: a reverse proxy may expose the server
+// under a path prefix it strips before the gateway sees the request, so the
+// gateway cannot infer its own public URI. It must be told.
+const RESOURCE_URI = (process.env.MCP_RESOURCE_URI || `${GATEWAY_URL}/mcp`).replace(/\/$/, '');
+const RESOURCE_PATH = new URL(RESOURCE_URI).pathname;
+
+// Resolves JWT_SECRET from Clay's Secrets Manager vaults (POL-SEC-001)
+// unless it is already present in the environment.
+const secretOrigin = await hydrateEnvFromVault({ JWT_SECRET: 'METABASE_MCP_GATEWAY_SECRET' });
 
 if (!process.env.JWT_SECRET) {
-  log('warn', 'JWT_SECRET is not set — using a random secret that will change on restart. Set JWT_SECRET in production.');
+  throw new Error(
+    'JWT_SECRET is required. Set the JWT_SECRET environment variable, or register ' +
+    `METABASE_MCP_GATEWAY_SECRET in ${vaultName()}.`
+  );
 }
-const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(32).toString('hex');
+const JWT_SECRET = process.env.JWT_SECRET;
+log('info', `JWT_SECRET loaded from ${secretOrigin.JWT_SECRET}`);
 
 // ── Pending authorization codes (in-memory, 10-min TTL) ─────────────────────
 
@@ -91,6 +116,61 @@ function verifyPkce(verifier: string, challenge: string): boolean {
   return computed === challenge;
 }
 
+// ── Token issuance ───────────────────────────────────────────────────────────
+// The JWT carries the Metabase credentials, so it *is* the credential: there is
+// no server-side session to look up. Access tokens are therefore short-lived and
+// renewed through a rotating refresh token rather than simply given a long life.
+
+interface Credentials {
+  metabase_url: string;
+  metabase_api_key?: string;
+  metabase_username?: string;
+  metabase_password?: string;
+  metabase_session_token?: string;
+}
+
+function credentialsFrom(src: Record<string, any>): Credentials {
+  const creds: Credentials = { metabase_url: src.metabase_url };
+  if (src.metabase_api_key)       creds.metabase_api_key       = src.metabase_api_key;
+  if (src.metabase_username)      creds.metabase_username      = src.metabase_username;
+  if (src.metabase_password)      creds.metabase_password      = src.metabase_password;
+  if (src.metabase_session_token) creds.metabase_session_token = src.metabase_session_token;
+  return creds;
+}
+
+// Stable, non-reversible id for a connection so logs can correlate one user's
+// tokens across issuance, refresh and expiry without ever recording a credential.
+function subjectOf(creds: Credentials): string {
+  const material = [
+    creds.metabase_url,
+    creds.metabase_username || '',
+    creds.metabase_api_key || creds.metabase_password || creds.metabase_session_token || '',
+  ].join('|');
+  return crypto.createHash('sha256').update(material).digest('hex').slice(0, 12);
+}
+
+function issueTokens(creds: Credentials) {
+  const sub = subjectOf(creds);
+  // A unique jti per token: HMAC over an identical payload is deterministic, so
+  // without it two tokens minted in the same second are byte-identical and
+  // rotating the refresh token would hand back the very token it replaces.
+  const jti = () => crypto.randomBytes(16).toString('hex');
+  const access  = jwt.sign({ ...creds, sub, jti: jti(), typ: 'access', aud: RESOURCE_URI }, JWT_SECRET, { expiresIn: TOKEN_EXPIRY } as jwt.SignOptions);
+  const refresh = jwt.sign({ ...creds, sub, jti: jti(), typ: 'refresh' }, JWT_SECRET, { expiresIn: REFRESH_TOKEN_EXPIRY } as jwt.SignOptions);
+  const { iat, exp } = jwt.decode(access)  as { iat: number; exp: number };
+  const refreshExp   = (jwt.decode(refresh) as { exp: number }).exp;
+  return {
+    sub,
+    body: {
+      access_token: access,
+      token_type: 'bearer',
+      expires_in: exp - iat,
+      refresh_token: refresh,
+      refresh_expires_in: refreshExp - iat,
+    },
+  };
+}
+
 // ── Dynamic client registration (RFC 7591) ───────────────────────────────────
 // Clients (e.g. Claude.ai) register automatically before starting the OAuth flow.
 // We accept any registration and return a client_id; we don't validate client
@@ -111,13 +191,31 @@ app.post('/oauth/register', (req: Request, res: Response) => {
     client_id,
     client_id_issued_at: Math.floor(Date.now() / 1000),
     redirect_uris,
-    grant_types: ['authorization_code'],
+    grant_types: ['authorization_code', 'refresh_token'],
     response_types: ['code'],
     token_endpoint_auth_method: 'none',
   });
 });
 
 // ── OAuth Discovery ──────────────────────────────────────────────────────────
+
+// ── Protected Resource Metadata (RFC 9728) ───────────────────────────────────
+// How an MCP client discovers which authorization server guards this resource.
+// RFC 9728 inserts the resource's path after the well-known segment, so the
+// document is served both bare and under /mcp for clients that follow either.
+
+const protectedResourceMetadata = (_req: Request, res: Response) => {
+  res.json({
+    resource: RESOURCE_URI,
+    authorization_servers: [GATEWAY_URL],
+    bearer_methods_supported: ['header'],
+  });
+};
+
+app.get('/.well-known/oauth-protected-resource', protectedResourceMetadata);
+if (RESOURCE_PATH !== '/') {
+  app.get(`/.well-known/oauth-protected-resource${RESOURCE_PATH}`, protectedResourceMetadata);
+}
 
 app.get('/.well-known/oauth-authorization-server', (_req: Request, res: Response) => {
   res.json({
@@ -126,7 +224,7 @@ app.get('/.well-known/oauth-authorization-server', (_req: Request, res: Response
     token_endpoint: `${GATEWAY_URL}/oauth/token`,
     registration_endpoint: `${GATEWAY_URL}/oauth/register`,
     response_types_supported: ['code'],
-    grant_types_supported: ['authorization_code'],
+    grant_types_supported: ['authorization_code', 'refresh_token'],
     code_challenge_methods_supported: ['S256'],
     token_endpoint_auth_methods_supported: ['none'],
   });
@@ -140,7 +238,7 @@ app.get('/.well-known/openid-configuration', (_req: Request, res: Response) => {
     token_endpoint: `${GATEWAY_URL}/oauth/token`,
     registration_endpoint: `${GATEWAY_URL}/oauth/register`,
     response_types_supported: ['code'],
-    grant_types_supported: ['authorization_code'],
+    grant_types_supported: ['authorization_code', 'refresh_token'],
     code_challenge_methods_supported: ['S256'],
   });
 });
@@ -318,22 +416,22 @@ app.get('/oauth/authorize', (req: Request, res: Response) => {
         <div class="divider">API Key</div>
 
         <label for="metabase_api_key">API Key</label>
-        <input type="password" id="metabase_api_key" name="metabase_api_key"
+        <input type="password" autocomplete="off" data-credential id="metabase_api_key" name="metabase_api_key"
                placeholder="mb_xxxxxxxx">
 
         <div class="divider">usuario y contraseña</div>
 
         <label for="metabase_username">Usuario</label>
-        <input type="text" id="metabase_username" name="metabase_username"
+        <input type="text" autocomplete="off" data-credential id="metabase_username" name="metabase_username"
                placeholder="admin@example.com">
 
         <label for="metabase_password">Contraseña</label>
-        <input type="password" id="metabase_password" name="metabase_password">
+        <input type="password" autocomplete="off" data-credential id="metabase_password" name="metabase_password">
 
         <div class="divider">token de sesión manual</div>
 
         <label for="metabase_session_token">Token de sesión</label>
-        <input type="password" id="metabase_session_token" name="metabase_session_token"
+        <input type="password" autocomplete="off" data-credential id="metabase_session_token" name="metabase_session_token"
                placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx">
         <p style="color:#6b7280;font-size:.75rem;margin-top:.4rem">
           DevTools → Application → Cookies → <code>metabase.SESSION</code>
@@ -427,6 +525,14 @@ app.get('/oauth/authorize', (req: Request, res: Response) => {
               var authData = await authResp.json();
               if (authData.session_token) {
                 setStatus('Autenticado. Conectando...', 'ok');
+                // Send only the session token. autocomplete="off" is a request,
+                // not a guarantee — password managers override it — and any
+                // leftover value in another credential field would outrank this
+                // one downstream and break a sign-in that just succeeded.
+                Array.prototype.forEach.call(
+                  document.querySelectorAll('[data-credential]'),
+                  function (el) { el.value = ''; }
+                );
                 document.getElementById('metabase_session_token').value = authData.session_token;
                 document.getElementById('form').submit();
               } else {
@@ -471,11 +577,11 @@ app.post('/oauth/authorize', (req: Request, res: Response) => {
     code_challenge,
     code_challenge_method,
     metabase_url,
-    metabase_api_key,
     metabase_username,
     metabase_password,
     metabase_session_token,
   } = req.body as Record<string, string>;
+  let { metabase_api_key } = req.body as Record<string, string>;
 
   if (!redirect_uri) {
     res.status(400).send('Missing redirect_uri');
@@ -485,6 +591,19 @@ app.post('/oauth/authorize', (req: Request, res: Response) => {
     res.status(400).send('Metabase URL is required');
     return;
   }
+
+  // A Metabase API key always starts with `mb_`. Anything else in this field is
+  // not a key, and the most common source is a browser password manager filling
+  // the form's first type=password input. Keeping it would be worse than
+  // dropping it: the API key outranks every other credential downstream, so a
+  // saved password would be sent as `X-API-Key` and Metabase would answer 401 —
+  // to someone who signed in with Google seconds earlier and has a perfectly
+  // good session token sitting in the very same request.
+  if (metabase_api_key && !metabase_api_key.startsWith('mb_')) {
+    log('warn', 'Discarded a malformed Metabase API key (must start with mb_)');
+    metabase_api_key = '';
+  }
+
   if (!metabase_api_key && !(metabase_username && metabase_password) && !metabase_session_token) {
     res.status(400).send('API key, username + password, or session token required');
     return;
@@ -510,9 +629,48 @@ app.post('/oauth/authorize', (req: Request, res: Response) => {
 
 // ── Token endpoint ───────────────────────────────────────────────────────────
 
+// Refresh grant — the client trades a refresh token for a fresh pair. The refresh
+// token is rotated on every use so that a leaked one has a bounded life.
+function handleRefresh(req: Request, res: Response) {
+  const { refresh_token } = req.body as Record<string, string>;
+
+  if (!refresh_token) {
+    res.status(400).json({ error: 'invalid_request', error_description: 'Missing refresh_token' });
+    return;
+  }
+
+  let payload: Record<string, any>;
+  try {
+    payload = jwt.verify(refresh_token, JWT_SECRET) as Record<string, any>;
+  } catch (err) {
+    const expired = err instanceof jwt.TokenExpiredError;
+    log('info', `token refresh rejected reason=${expired ? 'expired' : 'invalid'}`);
+    res.status(400).json({
+      error: 'invalid_grant',
+      error_description: expired ? 'Refresh token expired' : 'Refresh token invalid',
+    });
+    return;
+  }
+
+  // An access token must never be spendable as a refresh token.
+  if (payload.typ !== 'refresh') {
+    log('info', `token refresh rejected reason=wrong_token_type sub=${payload.sub || '-'}`);
+    res.status(400).json({ error: 'invalid_grant', error_description: 'Not a refresh token' });
+    return;
+  }
+
+  const { sub, body } = issueTokens(credentialsFrom(payload));
+  log('info', `token refreshed sub=${sub} expires_in=${body.expires_in}`);
+  res.json(body);
+}
+
 app.post('/oauth/token', (req: Request, res: Response) => {
   const { grant_type, code, code_verifier } = req.body as Record<string, string>;
 
+  if (grant_type === 'refresh_token') {
+    handleRefresh(req, res);
+    return;
+  }
   if (grant_type !== 'authorization_code') {
     res.status(400).json({ error: 'unsupported_grant_type' });
     return;
@@ -544,19 +702,9 @@ app.post('/oauth/token', (req: Request, res: Response) => {
 
   pendingCodes.delete(code);
 
-  const payload: Record<string, string> = { metabase_url: pending.metabase_url };
-  if (pending.metabase_api_key)       payload.metabase_api_key       = pending.metabase_api_key;
-  if (pending.metabase_username)      payload.metabase_username      = pending.metabase_username;
-  if (pending.metabase_password)      payload.metabase_password      = pending.metabase_password;
-  if (pending.metabase_session_token) payload.metabase_session_token = pending.metabase_session_token;
-
-  const token = jwt.sign(payload, JWT_SECRET, { expiresIn: TOKEN_EXPIRY } as jwt.SignOptions);
-
-  res.json({
-    access_token: token,
-    token_type: 'bearer',
-    expires_in: 8 * 60 * 60,
-  });
+  const { sub, body } = issueTokens(credentialsFrom(pending));
+  log('info', `token issued grant=authorization_code sub=${sub} expires_in=${body.expires_in}`);
+  res.json(body);
 });
 
 // ── MCP proxy ────────────────────────────────────────────────────────────────
@@ -569,12 +717,32 @@ app.use('/mcp', (req: Request, res: Response) => {
   const start = Date.now();
   const session = (req.headers['mcp-session-id'] as string || '').slice(0, 8) || '-';
   const method = (req.body as any)?.method || '-';
+
+  // Populated by the auth checks below so the access log can say *why* a request
+  // was rejected — an absent header and an expired token are different problems.
+  let sub = '-';
+  let denial = '';
+  let denialDetail = '';
+
   res.on('finish', () => {
-    log('info', `${req.method} /mcp session=${session} method=${method} status=${res.statusCode} ms=${Date.now() - start}`);
+    const why = denial ? ` reason=${denial}${denialDetail}` : '';
+    log('info', `${req.method} /mcp session=${session} sub=${sub} method=${method} status=${res.statusCode} ms=${Date.now() - start}${why}`);
   });
+
+  // Tells the client this is an authentication problem it can recover from by
+  // refreshing, rather than an opaque failure (RFC 6750). The resource_metadata
+  // pointer is how an MCP client discovers which authorization server to use.
+  const challenge = (error: string, description: string) =>
+    res.setHeader(
+      'WWW-Authenticate',
+      `Bearer realm="${GATEWAY_URL}", error="${error}", error_description="${description}", ` +
+      `resource_metadata="${GATEWAY_URL}/.well-known/oauth-protected-resource"`,
+    );
 
   const auth = req.headers['authorization'] as string | undefined;
   if (!auth?.startsWith('Bearer ')) {
+    denial = 'missing_bearer';
+    challenge('invalid_request', 'Bearer token required');
     res.status(401).json({ error: 'Bearer token required' });
     return;
   }
@@ -582,8 +750,47 @@ app.use('/mcp', (req: Request, res: Response) => {
   let payload: Record<string, string>;
   try {
     payload = jwt.verify(auth.slice(7), JWT_SECRET) as Record<string, string>;
-  } catch {
-    res.status(401).json({ error: 'invalid_token', error_description: 'Token invalid or expired' });
+  } catch (err) {
+    // Recover the subject from the unverified payload: an expired token is exactly
+    // the case worth correlating, and it is the one path where verification failed.
+    // This is a log label only — never trusted for authorization.
+    try {
+      const stale = jwt.decode(auth.slice(7)) as Record<string, string> | null;
+      if (stale?.sub) sub = stale.sub;
+    } catch { /* unparseable token — leave sub unset */ }
+
+    if (err instanceof jwt.TokenExpiredError) {
+      denial = 'token_expired';
+      denialDetail = ` expired_at=${err.expiredAt.toISOString()}`;
+      challenge('invalid_token', 'Token expired');
+      res.status(401).json({ error: 'invalid_token', error_description: 'Token expired' });
+    } else {
+      denial = 'token_invalid';
+      challenge('invalid_token', 'Token invalid');
+      res.status(401).json({ error: 'invalid_token', error_description: 'Token invalid' });
+    }
+    return;
+  }
+
+  sub = payload.sub || '-';
+
+  // Refresh tokens are long-lived by design; they must not authenticate MCP calls.
+  // Tokens issued before `typ` existed carry none, and stay valid until they expire.
+  if (payload.typ && payload.typ !== 'access') {
+    denial = 'wrong_token_type';
+    challenge('invalid_token', 'Not an access token');
+    res.status(401).json({ error: 'invalid_token', error_description: 'Not an access token' });
+    return;
+  }
+
+  // A token minted for a different resource must not be spendable here. Verified
+  // by hand rather than through jwt.verify's `audience` option, which rejects a
+  // token that carries no `aud` at all — that is every token issued before this
+  // claim existed, and rejecting those would disconnect their holders early.
+  if (payload.aud && payload.aud !== RESOURCE_URI) {
+    denial = 'wrong_audience';
+    challenge('invalid_token', 'Token issued for another resource');
+    res.status(401).json({ error: 'invalid_token', error_description: 'Token issued for another resource' });
     return;
   }
 

@@ -10,6 +10,7 @@ import { addTableTools } from "./tools/table-tools.js";
 import { addAdditionalTools } from "./tools/additional-tools.js";
 import { parseToolFilterOptions } from "./utils/tool-filters.js";
 import { createAuthenticateHandler, createClientResolver } from "./auth.js";
+import { hydrateEnvFromVault } from "./utils/secrets.js";
 
 // Parse command line arguments for tool filtering
 const filterOptions = parseToolFilterOptions();
@@ -20,6 +21,16 @@ const isHttpMode = process.env.MCP_TRANSPORT === 'http';
 // In httpStream mode, each client provides credentials via request headers.
 let defaultClient: MetabaseClient | null = null;
 if (!isHttpMode) {
+  // Resolve credentials from Clay's Secrets Manager vaults (POL-SEC-001).
+  // Only the API key is registered today; the username/password fallback is
+  // mapped anyway because keys absent from the vault are left undefined, so
+  // it starts working the day DevOps registers them — and nobody needs to
+  // put a password in a supervisor conf in the meantime.
+  await hydrateEnvFromVault({
+    METABASE_API_KEY: "METABASE_MCP_KEY",
+    METABASE_USERNAME: "METABASE_MCP_USERNAME",
+    METABASE_PASSWORD: "METABASE_MCP_PASSWORD",
+  });
   const config = loadConfig();
   validateConfig(config);
   defaultClient = new MetabaseClient(config);

@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import request from 'supertest';
 import jwt from 'jsonwebtoken';
 
@@ -245,6 +245,295 @@ describe('POST /oauth/token', () => {
   });
 });
 
+// ── Malformed API key (password-manager autofill) ────────────────────────────
+
+describe('POST /oauth/authorize - malformed API key', () => {
+  it('drops a value that cannot be an API key and keeps the session token', async () => {
+    const res = await request(app).post('/oauth/authorize').send({
+      redirect_uri: 'https://client.example.com/callback',
+      metabase_url: 'https://metabase.example.com',
+      metabase_api_key: 'my-saved-google-password',   // autofilled, not a key
+      metabase_session_token: 'a-real-session-uuid',
+    });
+    const code = new URL(res.headers['location'] as string).searchParams.get('code') as string;
+    const { body } = await request(app).post('/oauth/token').send({ grant_type: 'authorization_code', code });
+    const decoded = jwt.verify(body.access_token, 'test-secret-for-vitest') as Record<string, string>;
+
+    // The API key outranks every other credential downstream, so keeping it
+    // would send a password as X-API-Key and earn a 401 from Metabase.
+    expect(decoded.metabase_api_key).toBeUndefined();
+    expect(decoded.metabase_session_token).toBe('a-real-session-uuid');
+  });
+
+  it('keeps a well-formed API key', async () => {
+    const res = await request(app).post('/oauth/authorize').send({
+      redirect_uri: 'https://client.example.com/callback',
+      metabase_url: 'https://metabase.example.com',
+      metabase_api_key: 'mb_realkey12345',
+    });
+    const code = new URL(res.headers['location'] as string).searchParams.get('code') as string;
+    const { body } = await request(app).post('/oauth/token').send({ grant_type: 'authorization_code', code });
+    const decoded = jwt.verify(body.access_token, 'test-secret-for-vitest') as Record<string, string>;
+    expect(decoded.metabase_api_key).toBe('mb_realkey12345');
+  });
+
+  it('rejects when the malformed key was the only credential', async () => {
+    const res = await request(app).post('/oauth/authorize').send({
+      redirect_uri: 'https://client.example.com/callback',
+      metabase_url: 'https://metabase.example.com',
+      metabase_api_key: 'not-a-key',
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it('marks the credential inputs so the SSO path can clear them', async () => {
+    const res = await request(app).get('/oauth/authorize?redirect_uri=https://client.example.com/cb');
+    // Count the inputs themselves, not the querySelectorAll that clears them.
+    const inputs = (res.text.match(/autocomplete="off" data-credential/g) || []).length;
+    expect(inputs).toBe(4);
+    for (const id of ['metabase_api_key', 'metabase_username', 'metabase_password', 'metabase_session_token']) {
+      expect(res.text).toMatch(new RegExp(`autocomplete="off" data-credential id="${id}"`));
+    }
+  });
+});
+
+// ── Protected Resource Metadata (RFC 9728) ───────────────────────────────────
+
+describe('GET /.well-known/oauth-protected-resource', () => {
+  it('advertises the resource and its authorization server', async () => {
+    const res = await request(app).get('/.well-known/oauth-protected-resource');
+    expect(res.status).toBe(200);
+    expect(res.body.resource).toBe('https://mcp.example.com/mcp');
+    expect(res.body.authorization_servers).toContain('https://mcp.example.com');
+    expect(res.body.bearer_methods_supported).toContain('header');
+  });
+
+  it('is also served under the resource path, as RFC 9728 constructs it', async () => {
+    const res = await request(app).get('/.well-known/oauth-protected-resource/mcp');
+    expect(res.status).toBe(200);
+    expect(res.body.resource).toBe('https://mcp.example.com/mcp');
+  });
+
+  it('derives that path from the resource, not a hardcoded /mcp', async () => {
+    // A proxy may expose the server under a prefix it strips, so the well-known
+    // path RFC 9728 constructs is not always /.well-known/...-resource/mcp.
+    process.env.MCP_RESOURCE_URI = 'https://mcp.example.com/prefixed/mcp';
+    vi.resetModules();
+    const { app: prefixed } = await import('../src/oauth-gateway.js?prefixed');
+    delete process.env.MCP_RESOURCE_URI;
+
+    const res = await request(prefixed).get('/.well-known/oauth-protected-resource/prefixed/mcp');
+    expect(res.status).toBe(200);
+    expect(res.body.resource).toBe('https://mcp.example.com/prefixed/mcp');
+  });
+});
+
+// ── Audience binding ─────────────────────────────────────────────────────────
+
+describe('access token audience', () => {
+  it('binds the access token to the MCP resource', async () => {
+    const code = await getAuthCode({ apiKey: 'mb_aud_key' });
+    const { body } = await request(app).post('/oauth/token').send({ grant_type: 'authorization_code', code });
+    const decoded = jwt.verify(body.access_token, 'test-secret-for-vitest') as Record<string, string>;
+    expect(decoded.aud).toBe('https://mcp.example.com/mcp');
+  });
+
+  it('leaves the refresh token unbound — it is redeemed at the AS, not the resource', async () => {
+    const code = await getAuthCode({ apiKey: 'mb_aud_key' });
+    const { body } = await request(app).post('/oauth/token').send({ grant_type: 'authorization_code', code });
+    const decoded = jwt.verify(body.refresh_token, 'test-secret-for-vitest') as Record<string, string>;
+    expect(decoded.aud).toBeUndefined();
+  });
+
+  it('rejects a token minted for another resource', async () => {
+    const foreign = jwt.sign(
+      { metabase_url: 'https://metabase.example.com', typ: 'access', aud: 'https://other.example.com/mcp' },
+      'test-secret-for-vitest',
+      { expiresIn: '8h' },
+    );
+    const res = await request(app)
+      .post('/mcp')
+      .set('Authorization', `Bearer ${foreign}`)
+      .send({ jsonrpc: '2.0', method: 'tools/list', id: 1 });
+    expect(res.status).toBe(401);
+    expect(res.body.error_description).toBe('Token issued for another resource');
+  });
+
+  it('still accepts a token issued before the aud claim existed', async () => {
+    const legacy = jwt.sign(
+      { metabase_url: 'https://metabase.example.com' },
+      'test-secret-for-vitest',
+      { expiresIn: '8h' },
+    );
+    const res = await request(app)
+      .post('/mcp')
+      .set('Authorization', `Bearer ${legacy}`)
+      .send({ jsonrpc: '2.0', method: 'tools/list', id: 1 });
+    expect(res.status).not.toBe(401);
+  });
+
+  it('points the WWW-Authenticate challenge at the resource metadata', async () => {
+    const res = await request(app).post('/mcp').send({ jsonrpc: '2.0', method: 'tools/list', id: 1 });
+    expect(res.headers['www-authenticate']).toContain(
+      'resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource"',
+    );
+  });
+});
+
+// ── Refresh grant ────────────────────────────────────────────────────────────
+
+describe('POST /oauth/token - refresh_token grant', () => {
+  async function getTokenPair(opts = { apiKey: 'mb_refresh_key' }) {
+    const code = await getAuthCode(opts);
+    const res = await request(app).post('/oauth/token').send({ grant_type: 'authorization_code', code });
+    return res.body;
+  }
+
+  it('issues a refresh token alongside the access token', async () => {
+    const body = await getTokenPair();
+    expect(body.refresh_token).toBeTruthy();
+    expect(body.refresh_expires_in).toBeGreaterThan(body.expires_in);
+
+    const decoded = jwt.verify(body.refresh_token, 'test-secret-for-vitest') as Record<string, string>;
+    expect(decoded.typ).toBe('refresh');
+  });
+
+  it('marks access tokens with typ=access', async () => {
+    const body = await getTokenPair();
+    const decoded = jwt.verify(body.access_token, 'test-secret-for-vitest') as Record<string, string>;
+    expect(decoded.typ).toBe('access');
+  });
+
+  it('exchanges a refresh token for a fresh access token', async () => {
+    const body = await getTokenPair();
+    const res = await request(app).post('/oauth/token').send({
+      grant_type: 'refresh_token',
+      refresh_token: body.refresh_token,
+    });
+    expect(res.status).toBe(200);
+    expect(res.body.access_token).toBeTruthy();
+
+    const decoded = jwt.verify(res.body.access_token, 'test-secret-for-vitest') as Record<string, string>;
+    expect(decoded.typ).toBe('access');
+    expect(decoded.metabase_api_key).toBe('mb_refresh_key');
+  });
+
+  it('carries every credential shape across a refresh', async () => {
+    const body = await getTokenPair({ username: 'admin@example.com', password: 'secret' } as any);
+    const res = await request(app).post('/oauth/token').send({
+      grant_type: 'refresh_token',
+      refresh_token: body.refresh_token,
+    });
+    const decoded = jwt.verify(res.body.access_token, 'test-secret-for-vitest') as Record<string, string>;
+    expect(decoded.metabase_username).toBe('admin@example.com');
+    expect(decoded.metabase_password).toBe('secret');
+    expect(decoded.metabase_api_key).toBeUndefined();
+  });
+
+  it('rotates the refresh token on use', async () => {
+    const body = await getTokenPair();
+    const res = await request(app).post('/oauth/token').send({
+      grant_type: 'refresh_token',
+      refresh_token: body.refresh_token,
+    });
+    expect(res.body.refresh_token).toBeTruthy();
+    expect(res.body.refresh_token).not.toBe(body.refresh_token);
+  });
+
+  it('keeps a stable subject across refreshes so logs can correlate', async () => {
+    const body = await getTokenPair();
+    const first = jwt.verify(body.access_token, 'test-secret-for-vitest') as Record<string, string>;
+    const res = await request(app).post('/oauth/token').send({
+      grant_type: 'refresh_token',
+      refresh_token: body.refresh_token,
+    });
+    const second = jwt.verify(res.body.access_token, 'test-secret-for-vitest') as Record<string, string>;
+    expect(second.sub).toBe(first.sub);
+    expect(first.sub).toMatch(/^[0-9a-f]{12}$/);
+  });
+
+  it('never leaks a credential into the subject', async () => {
+    const body = await getTokenPair({ apiKey: 'mb_super_secret' } as any);
+    const decoded = jwt.verify(body.access_token, 'test-secret-for-vitest') as Record<string, string>;
+    expect(decoded.sub).not.toContain('mb_super_secret');
+  });
+
+  it('refuses an access token used as a refresh token', async () => {
+    const body = await getTokenPair();
+    const res = await request(app).post('/oauth/token').send({
+      grant_type: 'refresh_token',
+      refresh_token: body.access_token,
+    });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe('invalid_grant');
+    expect(res.body.error_description).toBe('Not a refresh token');
+  });
+
+  it('rejects a missing refresh_token', async () => {
+    const res = await request(app).post('/oauth/token').send({ grant_type: 'refresh_token' });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe('invalid_request');
+  });
+
+  it('rejects a malformed refresh token', async () => {
+    const res = await request(app).post('/oauth/token').send({
+      grant_type: 'refresh_token',
+      refresh_token: 'not.a.jwt',
+    });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe('invalid_grant');
+  });
+
+  it('rejects a refresh token signed with the wrong secret', async () => {
+    const forged = jwt.sign(
+      { metabase_url: 'https://metabase.example.com', typ: 'refresh' },
+      'attacker-secret',
+      { expiresIn: '30d' },
+    );
+    const res = await request(app).post('/oauth/token').send({
+      grant_type: 'refresh_token',
+      refresh_token: forged,
+    });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe('invalid_grant');
+  });
+
+  it('rejects an expired refresh token', async () => {
+    const expired = jwt.sign(
+      { metabase_url: 'https://metabase.example.com', typ: 'refresh' },
+      'test-secret-for-vitest',
+      { expiresIn: '-1s' },
+    );
+    const res = await request(app).post('/oauth/token').send({
+      grant_type: 'refresh_token',
+      refresh_token: expired,
+    });
+    expect(res.status).toBe(400);
+    expect(res.body.error_description).toBe('Refresh token expired');
+  });
+});
+
+// ── Discovery advertises the refresh grant ───────────────────────────────────
+
+describe('refresh grant advertisement', () => {
+  it('lists refresh_token in authorization server metadata', async () => {
+    const res = await request(app).get('/.well-known/oauth-authorization-server');
+    expect(res.body.grant_types_supported).toContain('refresh_token');
+  });
+
+  it('lists refresh_token in openid configuration', async () => {
+    const res = await request(app).get('/.well-known/openid-configuration');
+    expect(res.body.grant_types_supported).toContain('refresh_token');
+  });
+
+  it('lists refresh_token on client registration', async () => {
+    const res = await request(app).post('/oauth/register').send({
+      redirect_uris: ['https://client.example.com/callback'],
+    });
+    expect(res.body.grant_types).toContain('refresh_token');
+  });
+});
+
 // ── PKCE ─────────────────────────────────────────────────────────────────────
 
 describe('PKCE (S256)', () => {
@@ -310,6 +599,53 @@ describe('POST /mcp - authentication', () => {
       .set('Authorization', 'Basic dXNlcjpwYXNz')
       .send({ jsonrpc: '2.0', method: 'tools/list', id: 1 });
     expect(res.status).toBe(401);
+  });
+
+  it('distinguishes an expired token from an invalid one', async () => {
+    const expired = jwt.sign(
+      { metabase_url: 'https://metabase.example.com', typ: 'access' },
+      'test-secret-for-vitest',
+      { expiresIn: '-1s' },
+    );
+    const res = await request(app)
+      .post('/mcp')
+      .set('Authorization', `Bearer ${expired}`)
+      .send({ jsonrpc: '2.0', method: 'tools/list', id: 1 });
+    expect(res.status).toBe(401);
+    expect(res.body.error_description).toBe('Token expired');
+
+    const bad = await request(app)
+      .post('/mcp')
+      .set('Authorization', 'Bearer not.a.jwt')
+      .send({ jsonrpc: '2.0', method: 'tools/list', id: 1 });
+    expect(bad.body.error_description).toBe('Token invalid');
+  });
+
+  it('refuses a refresh token used as a bearer credential', async () => {
+    const code = await getAuthCode({ apiKey: 'mb_key' });
+    const { body } = await request(app).post('/oauth/token').send({ grant_type: 'authorization_code', code });
+    const res = await request(app)
+      .post('/mcp')
+      .set('Authorization', `Bearer ${body.refresh_token}`)
+      .send({ jsonrpc: '2.0', method: 'tools/list', id: 1 });
+    expect(res.status).toBe(401);
+    expect(res.body.error_description).toBe('Not an access token');
+  });
+
+  it('sends a WWW-Authenticate challenge so the client knows to renew', async () => {
+    const expired = jwt.sign(
+      { metabase_url: 'https://metabase.example.com', typ: 'access' },
+      'test-secret-for-vitest',
+      { expiresIn: '-1s' },
+    );
+    const res = await request(app)
+      .post('/mcp')
+      .set('Authorization', `Bearer ${expired}`)
+      .send({ jsonrpc: '2.0', method: 'tools/list', id: 1 });
+    expect(res.headers['www-authenticate']).toContain('error="invalid_token"');
+
+    const none = await request(app).post('/mcp').send({ jsonrpc: '2.0', method: 'tools/list', id: 1 });
+    expect(none.headers['www-authenticate']).toContain('Bearer realm=');
   });
 });
 
