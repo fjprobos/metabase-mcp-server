@@ -9,16 +9,19 @@
  *   1. Claude.ai discovers /oauth/authorize via /.well-known/oauth-authorization-server
  *   2. Claude.ai redirects user to /oauth/authorize  →  HTML form (Metabase URL + key)
  *   3. User submits  →  server stores creds under a temp code  →  redirect back to client
- *   4. Claude.ai POSTs /oauth/token with code  →  server returns signed JWT
+ *   4. Claude.ai POSTs /oauth/token with code  →  server returns access + refresh JWT
  *   5. Claude.ai calls /mcp with  Authorization: Bearer <JWT>
  *   6. Gateway validates JWT, injects x-metabase-* headers, proxies to FastMCP
+ *   7. When the access token expires, Claude.ai POSTs /oauth/token with
+ *      grant_type=refresh_token  →  server returns a fresh pair (rotation)
  *
  * Environment variables:
- *   GATEWAY_URL     Public base URL of this gateway  (e.g. https://mcp.example.com)
- *   GATEWAY_PORT    Port to listen on                (default: 8080)
- *   MCP_UPSTREAM    FastMCP HTTP Stream URL           (default: http://localhost:8011)
- *   JWT_SECRET      Secret for signing tokens        (required — env var or vault)
- *   TOKEN_EXPIRY    JWT expiry                       (default: 8h)
+ *   GATEWAY_URL            Public base URL of this gateway  (e.g. https://mcp.example.com)
+ *   GATEWAY_PORT           Port to listen on                (default: 8080)
+ *   MCP_UPSTREAM           FastMCP HTTP Stream URL          (default: http://localhost:8011)
+ *   JWT_SECRET             Secret for signing tokens        (required — env var or vault)
+ *   TOKEN_EXPIRY           Access token expiry              (default: 8h)
+ *   REFRESH_TOKEN_EXPIRY   Refresh token expiry             (default: 30d)
  */
 
 import express, { Request, Response, NextFunction } from 'express';
@@ -46,6 +49,7 @@ const GATEWAY_URL  = (process.env.GATEWAY_URL  || 'http://localhost:8080').repla
 const GATEWAY_PORT = parseInt(process.env.GATEWAY_PORT || '8080');
 const MCP_UPSTREAM = (process.env.MCP_UPSTREAM  || 'http://localhost:8011').replace(/\/$/, '');
 const TOKEN_EXPIRY = process.env.TOKEN_EXPIRY   || '8h';
+const REFRESH_TOKEN_EXPIRY = process.env.REFRESH_TOKEN_EXPIRY || '30d';
 
 // Resolves JWT_SECRET from Clay's Secrets Manager vaults (POL-SEC-001)
 // unless it is already present in the environment.
@@ -100,6 +104,61 @@ function verifyPkce(verifier: string, challenge: string): boolean {
   return computed === challenge;
 }
 
+// ── Token issuance ───────────────────────────────────────────────────────────
+// The JWT carries the Metabase credentials, so it *is* the credential: there is
+// no server-side session to look up. Access tokens are therefore short-lived and
+// renewed through a rotating refresh token rather than simply given a long life.
+
+interface Credentials {
+  metabase_url: string;
+  metabase_api_key?: string;
+  metabase_username?: string;
+  metabase_password?: string;
+  metabase_session_token?: string;
+}
+
+function credentialsFrom(src: Record<string, any>): Credentials {
+  const creds: Credentials = { metabase_url: src.metabase_url };
+  if (src.metabase_api_key)       creds.metabase_api_key       = src.metabase_api_key;
+  if (src.metabase_username)      creds.metabase_username      = src.metabase_username;
+  if (src.metabase_password)      creds.metabase_password      = src.metabase_password;
+  if (src.metabase_session_token) creds.metabase_session_token = src.metabase_session_token;
+  return creds;
+}
+
+// Stable, non-reversible id for a connection so logs can correlate one user's
+// tokens across issuance, refresh and expiry without ever recording a credential.
+function subjectOf(creds: Credentials): string {
+  const material = [
+    creds.metabase_url,
+    creds.metabase_username || '',
+    creds.metabase_api_key || creds.metabase_password || creds.metabase_session_token || '',
+  ].join('|');
+  return crypto.createHash('sha256').update(material).digest('hex').slice(0, 12);
+}
+
+function issueTokens(creds: Credentials) {
+  const sub = subjectOf(creds);
+  // A unique jti per token: HMAC over an identical payload is deterministic, so
+  // without it two tokens minted in the same second are byte-identical and
+  // rotating the refresh token would hand back the very token it replaces.
+  const jti = () => crypto.randomBytes(16).toString('hex');
+  const access  = jwt.sign({ ...creds, sub, jti: jti(), typ: 'access'  }, JWT_SECRET, { expiresIn: TOKEN_EXPIRY }         as jwt.SignOptions);
+  const refresh = jwt.sign({ ...creds, sub, jti: jti(), typ: 'refresh' }, JWT_SECRET, { expiresIn: REFRESH_TOKEN_EXPIRY } as jwt.SignOptions);
+  const { iat, exp } = jwt.decode(access)  as { iat: number; exp: number };
+  const refreshExp   = (jwt.decode(refresh) as { exp: number }).exp;
+  return {
+    sub,
+    body: {
+      access_token: access,
+      token_type: 'bearer',
+      expires_in: exp - iat,
+      refresh_token: refresh,
+      refresh_expires_in: refreshExp - iat,
+    },
+  };
+}
+
 // ── Dynamic client registration (RFC 7591) ───────────────────────────────────
 // Clients (e.g. Claude.ai) register automatically before starting the OAuth flow.
 // We accept any registration and return a client_id; we don't validate client
@@ -120,7 +179,7 @@ app.post('/oauth/register', (req: Request, res: Response) => {
     client_id,
     client_id_issued_at: Math.floor(Date.now() / 1000),
     redirect_uris,
-    grant_types: ['authorization_code'],
+    grant_types: ['authorization_code', 'refresh_token'],
     response_types: ['code'],
     token_endpoint_auth_method: 'none',
   });
@@ -135,7 +194,7 @@ app.get('/.well-known/oauth-authorization-server', (_req: Request, res: Response
     token_endpoint: `${GATEWAY_URL}/oauth/token`,
     registration_endpoint: `${GATEWAY_URL}/oauth/register`,
     response_types_supported: ['code'],
-    grant_types_supported: ['authorization_code'],
+    grant_types_supported: ['authorization_code', 'refresh_token'],
     code_challenge_methods_supported: ['S256'],
     token_endpoint_auth_methods_supported: ['none'],
   });
@@ -149,7 +208,7 @@ app.get('/.well-known/openid-configuration', (_req: Request, res: Response) => {
     token_endpoint: `${GATEWAY_URL}/oauth/token`,
     registration_endpoint: `${GATEWAY_URL}/oauth/register`,
     response_types_supported: ['code'],
-    grant_types_supported: ['authorization_code'],
+    grant_types_supported: ['authorization_code', 'refresh_token'],
     code_challenge_methods_supported: ['S256'],
   });
 });
@@ -519,9 +578,48 @@ app.post('/oauth/authorize', (req: Request, res: Response) => {
 
 // ── Token endpoint ───────────────────────────────────────────────────────────
 
+// Refresh grant — the client trades a refresh token for a fresh pair. The refresh
+// token is rotated on every use so that a leaked one has a bounded life.
+function handleRefresh(req: Request, res: Response) {
+  const { refresh_token } = req.body as Record<string, string>;
+
+  if (!refresh_token) {
+    res.status(400).json({ error: 'invalid_request', error_description: 'Missing refresh_token' });
+    return;
+  }
+
+  let payload: Record<string, any>;
+  try {
+    payload = jwt.verify(refresh_token, JWT_SECRET) as Record<string, any>;
+  } catch (err) {
+    const expired = err instanceof jwt.TokenExpiredError;
+    log('info', `token refresh rejected reason=${expired ? 'expired' : 'invalid'}`);
+    res.status(400).json({
+      error: 'invalid_grant',
+      error_description: expired ? 'Refresh token expired' : 'Refresh token invalid',
+    });
+    return;
+  }
+
+  // An access token must never be spendable as a refresh token.
+  if (payload.typ !== 'refresh') {
+    log('info', `token refresh rejected reason=wrong_token_type sub=${payload.sub || '-'}`);
+    res.status(400).json({ error: 'invalid_grant', error_description: 'Not a refresh token' });
+    return;
+  }
+
+  const { sub, body } = issueTokens(credentialsFrom(payload));
+  log('info', `token refreshed sub=${sub} expires_in=${body.expires_in}`);
+  res.json(body);
+}
+
 app.post('/oauth/token', (req: Request, res: Response) => {
   const { grant_type, code, code_verifier } = req.body as Record<string, string>;
 
+  if (grant_type === 'refresh_token') {
+    handleRefresh(req, res);
+    return;
+  }
   if (grant_type !== 'authorization_code') {
     res.status(400).json({ error: 'unsupported_grant_type' });
     return;
@@ -553,20 +651,9 @@ app.post('/oauth/token', (req: Request, res: Response) => {
 
   pendingCodes.delete(code);
 
-  const payload: Record<string, string> = { metabase_url: pending.metabase_url };
-  if (pending.metabase_api_key)       payload.metabase_api_key       = pending.metabase_api_key;
-  if (pending.metabase_username)      payload.metabase_username      = pending.metabase_username;
-  if (pending.metabase_password)      payload.metabase_password      = pending.metabase_password;
-  if (pending.metabase_session_token) payload.metabase_session_token = pending.metabase_session_token;
-
-  const token = jwt.sign(payload, JWT_SECRET, { expiresIn: TOKEN_EXPIRY } as jwt.SignOptions);
-  const { iat, exp } = jwt.decode(token) as { iat: number; exp: number };
-
-  res.json({
-    access_token: token,
-    token_type: 'bearer',
-    expires_in: exp - iat,
-  });
+  const { sub, body } = issueTokens(credentialsFrom(pending));
+  log('info', `token issued grant=authorization_code sub=${sub} expires_in=${body.expires_in}`);
+  res.json(body);
 });
 
 // ── MCP proxy ────────────────────────────────────────────────────────────────
@@ -582,16 +669,17 @@ app.use('/mcp', (req: Request, res: Response) => {
 
   // Populated by the auth checks below so the access log can say *why* a request
   // was rejected — an absent header and an expired token are different problems.
+  let sub = '-';
   let denial = '';
   let denialDetail = '';
 
   res.on('finish', () => {
     const why = denial ? ` reason=${denial}${denialDetail}` : '';
-    log('info', `${req.method} /mcp session=${session} method=${method} status=${res.statusCode} ms=${Date.now() - start}${why}`);
+    log('info', `${req.method} /mcp session=${session} sub=${sub} method=${method} status=${res.statusCode} ms=${Date.now() - start}${why}`);
   });
 
-  // Tells the client this is an authentication problem it can recover from,
-  // rather than an opaque failure. Required by RFC 6750.
+  // Tells the client this is an authentication problem it can recover from by
+  // refreshing, rather than an opaque failure. Required by RFC 6750.
   const challenge = (error: string, description: string) =>
     res.setHeader('WWW-Authenticate', `Bearer realm="${GATEWAY_URL}", error="${error}", error_description="${description}"`);
 
@@ -607,6 +695,14 @@ app.use('/mcp', (req: Request, res: Response) => {
   try {
     payload = jwt.verify(auth.slice(7), JWT_SECRET) as Record<string, string>;
   } catch (err) {
+    // Recover the subject from the unverified payload: an expired token is exactly
+    // the case worth correlating, and it is the one path where verification failed.
+    // This is a log label only — never trusted for authorization.
+    try {
+      const stale = jwt.decode(auth.slice(7)) as Record<string, string> | null;
+      if (stale?.sub) sub = stale.sub;
+    } catch { /* unparseable token — leave sub unset */ }
+
     if (err instanceof jwt.TokenExpiredError) {
       denial = 'token_expired';
       denialDetail = ` expired_at=${err.expiredAt.toISOString()}`;
@@ -617,6 +713,17 @@ app.use('/mcp', (req: Request, res: Response) => {
       challenge('invalid_token', 'Token invalid');
       res.status(401).json({ error: 'invalid_token', error_description: 'Token invalid' });
     }
+    return;
+  }
+
+  sub = payload.sub || '-';
+
+  // Refresh tokens are long-lived by design; they must not authenticate MCP calls.
+  // Tokens issued before `typ` existed carry none, and stay valid until they expire.
+  if (payload.typ && payload.typ !== 'access') {
+    denial = 'wrong_token_type';
+    challenge('invalid_token', 'Not an access token');
+    res.status(401).json({ error: 'invalid_token', error_description: 'Not an access token' });
     return;
   }
 
