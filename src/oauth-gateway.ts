@@ -51,6 +51,11 @@ const MCP_UPSTREAM = (process.env.MCP_UPSTREAM  || 'http://localhost:8011').repl
 const TOKEN_EXPIRY = process.env.TOKEN_EXPIRY   || '8h';
 const REFRESH_TOKEN_EXPIRY = process.env.REFRESH_TOKEN_EXPIRY || '30d';
 
+// Canonical URI of the MCP server this gateway protects (RFC 8707 / RFC 9728).
+// Access tokens are bound to it so a token minted for another resource cannot be
+// replayed here, which MCP requires resource servers to enforce.
+const RESOURCE_URI = `${GATEWAY_URL}/mcp`;
+
 // Resolves JWT_SECRET from Clay's Secrets Manager vaults (POL-SEC-001)
 // unless it is already present in the environment.
 const secretOrigin = await hydrateEnvFromVault({ JWT_SECRET: 'METABASE_MCP_GATEWAY_SECRET' });
@@ -143,7 +148,7 @@ function issueTokens(creds: Credentials) {
   // without it two tokens minted in the same second are byte-identical and
   // rotating the refresh token would hand back the very token it replaces.
   const jti = () => crypto.randomBytes(16).toString('hex');
-  const access  = jwt.sign({ ...creds, sub, jti: jti(), typ: 'access'  }, JWT_SECRET, { expiresIn: TOKEN_EXPIRY }         as jwt.SignOptions);
+  const access  = jwt.sign({ ...creds, sub, jti: jti(), typ: 'access', aud: RESOURCE_URI }, JWT_SECRET, { expiresIn: TOKEN_EXPIRY } as jwt.SignOptions);
   const refresh = jwt.sign({ ...creds, sub, jti: jti(), typ: 'refresh' }, JWT_SECRET, { expiresIn: REFRESH_TOKEN_EXPIRY } as jwt.SignOptions);
   const { iat, exp } = jwt.decode(access)  as { iat: number; exp: number };
   const refreshExp   = (jwt.decode(refresh) as { exp: number }).exp;
@@ -186,6 +191,22 @@ app.post('/oauth/register', (req: Request, res: Response) => {
 });
 
 // ── OAuth Discovery ──────────────────────────────────────────────────────────
+
+// ── Protected Resource Metadata (RFC 9728) ───────────────────────────────────
+// How an MCP client discovers which authorization server guards this resource.
+// RFC 9728 inserts the resource's path after the well-known segment, so the
+// document is served both bare and under /mcp for clients that follow either.
+
+const protectedResourceMetadata = (_req: Request, res: Response) => {
+  res.json({
+    resource: RESOURCE_URI,
+    authorization_servers: [GATEWAY_URL],
+    bearer_methods_supported: ['header'],
+  });
+};
+
+app.get('/.well-known/oauth-protected-resource', protectedResourceMetadata);
+app.get('/.well-known/oauth-protected-resource/mcp', protectedResourceMetadata);
 
 app.get('/.well-known/oauth-authorization-server', (_req: Request, res: Response) => {
   res.json({
@@ -679,9 +700,14 @@ app.use('/mcp', (req: Request, res: Response) => {
   });
 
   // Tells the client this is an authentication problem it can recover from by
-  // refreshing, rather than an opaque failure. Required by RFC 6750.
+  // refreshing, rather than an opaque failure (RFC 6750). The resource_metadata
+  // pointer is how an MCP client discovers which authorization server to use.
   const challenge = (error: string, description: string) =>
-    res.setHeader('WWW-Authenticate', `Bearer realm="${GATEWAY_URL}", error="${error}", error_description="${description}"`);
+    res.setHeader(
+      'WWW-Authenticate',
+      `Bearer realm="${GATEWAY_URL}", error="${error}", error_description="${description}", ` +
+      `resource_metadata="${GATEWAY_URL}/.well-known/oauth-protected-resource"`,
+    );
 
   const auth = req.headers['authorization'] as string | undefined;
   if (!auth?.startsWith('Bearer ')) {
@@ -724,6 +750,17 @@ app.use('/mcp', (req: Request, res: Response) => {
     denial = 'wrong_token_type';
     challenge('invalid_token', 'Not an access token');
     res.status(401).json({ error: 'invalid_token', error_description: 'Not an access token' });
+    return;
+  }
+
+  // A token minted for a different resource must not be spendable here. Verified
+  // by hand rather than through jwt.verify's `audience` option, which rejects a
+  // token that carries no `aud` at all — that is every token issued before this
+  // claim existed, and rejecting those would disconnect their holders early.
+  if (payload.aud && payload.aud !== RESOURCE_URI) {
+    denial = 'wrong_audience';
+    challenge('invalid_token', 'Token issued for another resource');
+    res.status(401).json({ error: 'invalid_token', error_description: 'Token issued for another resource' });
     return;
   }
 

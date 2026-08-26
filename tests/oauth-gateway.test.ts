@@ -245,6 +245,76 @@ describe('POST /oauth/token', () => {
   });
 });
 
+// ── Protected Resource Metadata (RFC 9728) ───────────────────────────────────
+
+describe('GET /.well-known/oauth-protected-resource', () => {
+  it('advertises the resource and its authorization server', async () => {
+    const res = await request(app).get('/.well-known/oauth-protected-resource');
+    expect(res.status).toBe(200);
+    expect(res.body.resource).toBe('https://mcp.example.com/mcp');
+    expect(res.body.authorization_servers).toContain('https://mcp.example.com');
+    expect(res.body.bearer_methods_supported).toContain('header');
+  });
+
+  it('is also served under the resource path, as RFC 9728 constructs it', async () => {
+    const res = await request(app).get('/.well-known/oauth-protected-resource/mcp');
+    expect(res.status).toBe(200);
+    expect(res.body.resource).toBe('https://mcp.example.com/mcp');
+  });
+});
+
+// ── Audience binding ─────────────────────────────────────────────────────────
+
+describe('access token audience', () => {
+  it('binds the access token to the MCP resource', async () => {
+    const code = await getAuthCode({ apiKey: 'mb_aud_key' });
+    const { body } = await request(app).post('/oauth/token').send({ grant_type: 'authorization_code', code });
+    const decoded = jwt.verify(body.access_token, 'test-secret-for-vitest') as Record<string, string>;
+    expect(decoded.aud).toBe('https://mcp.example.com/mcp');
+  });
+
+  it('leaves the refresh token unbound — it is redeemed at the AS, not the resource', async () => {
+    const code = await getAuthCode({ apiKey: 'mb_aud_key' });
+    const { body } = await request(app).post('/oauth/token').send({ grant_type: 'authorization_code', code });
+    const decoded = jwt.verify(body.refresh_token, 'test-secret-for-vitest') as Record<string, string>;
+    expect(decoded.aud).toBeUndefined();
+  });
+
+  it('rejects a token minted for another resource', async () => {
+    const foreign = jwt.sign(
+      { metabase_url: 'https://metabase.example.com', typ: 'access', aud: 'https://other.example.com/mcp' },
+      'test-secret-for-vitest',
+      { expiresIn: '8h' },
+    );
+    const res = await request(app)
+      .post('/mcp')
+      .set('Authorization', `Bearer ${foreign}`)
+      .send({ jsonrpc: '2.0', method: 'tools/list', id: 1 });
+    expect(res.status).toBe(401);
+    expect(res.body.error_description).toBe('Token issued for another resource');
+  });
+
+  it('still accepts a token issued before the aud claim existed', async () => {
+    const legacy = jwt.sign(
+      { metabase_url: 'https://metabase.example.com' },
+      'test-secret-for-vitest',
+      { expiresIn: '8h' },
+    );
+    const res = await request(app)
+      .post('/mcp')
+      .set('Authorization', `Bearer ${legacy}`)
+      .send({ jsonrpc: '2.0', method: 'tools/list', id: 1 });
+    expect(res.status).not.toBe(401);
+  });
+
+  it('points the WWW-Authenticate challenge at the resource metadata', async () => {
+    const res = await request(app).post('/mcp').send({ jsonrpc: '2.0', method: 'tools/list', id: 1 });
+    expect(res.headers['www-authenticate']).toContain(
+      'resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource"',
+    );
+  });
+});
+
 // ── Refresh grant ────────────────────────────────────────────────────────────
 
 describe('POST /oauth/token - refresh_token grant', () => {
