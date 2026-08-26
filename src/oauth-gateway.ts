@@ -416,22 +416,22 @@ app.get('/oauth/authorize', (req: Request, res: Response) => {
         <div class="divider">API Key</div>
 
         <label for="metabase_api_key">API Key</label>
-        <input type="password" id="metabase_api_key" name="metabase_api_key"
+        <input type="password" autocomplete="off" data-credential id="metabase_api_key" name="metabase_api_key"
                placeholder="mb_xxxxxxxx">
 
         <div class="divider">usuario y contraseña</div>
 
         <label for="metabase_username">Usuario</label>
-        <input type="text" id="metabase_username" name="metabase_username"
+        <input type="text" autocomplete="off" data-credential id="metabase_username" name="metabase_username"
                placeholder="admin@example.com">
 
         <label for="metabase_password">Contraseña</label>
-        <input type="password" id="metabase_password" name="metabase_password">
+        <input type="password" autocomplete="off" data-credential id="metabase_password" name="metabase_password">
 
         <div class="divider">token de sesión manual</div>
 
         <label for="metabase_session_token">Token de sesión</label>
-        <input type="password" id="metabase_session_token" name="metabase_session_token"
+        <input type="password" autocomplete="off" data-credential id="metabase_session_token" name="metabase_session_token"
                placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx">
         <p style="color:#6b7280;font-size:.75rem;margin-top:.4rem">
           DevTools → Application → Cookies → <code>metabase.SESSION</code>
@@ -525,6 +525,14 @@ app.get('/oauth/authorize', (req: Request, res: Response) => {
               var authData = await authResp.json();
               if (authData.session_token) {
                 setStatus('Autenticado. Conectando...', 'ok');
+                // Send only the session token. autocomplete="off" is a request,
+                // not a guarantee — password managers override it — and any
+                // leftover value in another credential field would outrank this
+                // one downstream and break a sign-in that just succeeded.
+                Array.prototype.forEach.call(
+                  document.querySelectorAll('[data-credential]'),
+                  function (el) { el.value = ''; }
+                );
                 document.getElementById('metabase_session_token').value = authData.session_token;
                 document.getElementById('form').submit();
               } else {
@@ -569,11 +577,11 @@ app.post('/oauth/authorize', (req: Request, res: Response) => {
     code_challenge,
     code_challenge_method,
     metabase_url,
-    metabase_api_key,
     metabase_username,
     metabase_password,
     metabase_session_token,
   } = req.body as Record<string, string>;
+  let { metabase_api_key } = req.body as Record<string, string>;
 
   if (!redirect_uri) {
     res.status(400).send('Missing redirect_uri');
@@ -583,6 +591,19 @@ app.post('/oauth/authorize', (req: Request, res: Response) => {
     res.status(400).send('Metabase URL is required');
     return;
   }
+
+  // A Metabase API key always starts with `mb_`. Anything else in this field is
+  // not a key, and the most common source is a browser password manager filling
+  // the form's first type=password input. Keeping it would be worse than
+  // dropping it: the API key outranks every other credential downstream, so a
+  // saved password would be sent as `X-API-Key` and Metabase would answer 401 —
+  // to someone who signed in with Google seconds earlier and has a perfectly
+  // good session token sitting in the very same request.
+  if (metabase_api_key && !metabase_api_key.startsWith('mb_')) {
+    log('warn', 'Discarded a malformed Metabase API key (must start with mb_)');
+    metabase_api_key = '';
+  }
+
   if (!metabase_api_key && !(metabase_username && metabase_password) && !metabase_session_token) {
     res.status(400).send('API key, username + password, or session token required');
     return;

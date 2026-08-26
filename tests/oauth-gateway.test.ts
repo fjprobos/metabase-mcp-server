@@ -245,6 +245,58 @@ describe('POST /oauth/token', () => {
   });
 });
 
+// ── Malformed API key (password-manager autofill) ────────────────────────────
+
+describe('POST /oauth/authorize - malformed API key', () => {
+  it('drops a value that cannot be an API key and keeps the session token', async () => {
+    const res = await request(app).post('/oauth/authorize').send({
+      redirect_uri: 'https://client.example.com/callback',
+      metabase_url: 'https://metabase.example.com',
+      metabase_api_key: 'my-saved-google-password',   // autofilled, not a key
+      metabase_session_token: 'a-real-session-uuid',
+    });
+    const code = new URL(res.headers['location'] as string).searchParams.get('code') as string;
+    const { body } = await request(app).post('/oauth/token').send({ grant_type: 'authorization_code', code });
+    const decoded = jwt.verify(body.access_token, 'test-secret-for-vitest') as Record<string, string>;
+
+    // The API key outranks every other credential downstream, so keeping it
+    // would send a password as X-API-Key and earn a 401 from Metabase.
+    expect(decoded.metabase_api_key).toBeUndefined();
+    expect(decoded.metabase_session_token).toBe('a-real-session-uuid');
+  });
+
+  it('keeps a well-formed API key', async () => {
+    const res = await request(app).post('/oauth/authorize').send({
+      redirect_uri: 'https://client.example.com/callback',
+      metabase_url: 'https://metabase.example.com',
+      metabase_api_key: 'mb_realkey12345',
+    });
+    const code = new URL(res.headers['location'] as string).searchParams.get('code') as string;
+    const { body } = await request(app).post('/oauth/token').send({ grant_type: 'authorization_code', code });
+    const decoded = jwt.verify(body.access_token, 'test-secret-for-vitest') as Record<string, string>;
+    expect(decoded.metabase_api_key).toBe('mb_realkey12345');
+  });
+
+  it('rejects when the malformed key was the only credential', async () => {
+    const res = await request(app).post('/oauth/authorize').send({
+      redirect_uri: 'https://client.example.com/callback',
+      metabase_url: 'https://metabase.example.com',
+      metabase_api_key: 'not-a-key',
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it('marks the credential inputs so the SSO path can clear them', async () => {
+    const res = await request(app).get('/oauth/authorize?redirect_uri=https://client.example.com/cb');
+    // Count the inputs themselves, not the querySelectorAll that clears them.
+    const inputs = (res.text.match(/autocomplete="off" data-credential/g) || []).length;
+    expect(inputs).toBe(4);
+    for (const id of ['metabase_api_key', 'metabase_username', 'metabase_password', 'metabase_session_token']) {
+      expect(res.text).toMatch(new RegExp(`autocomplete="off" data-credential id="${id}"`));
+    }
+  });
+});
+
 // ── Protected Resource Metadata (RFC 9728) ───────────────────────────────────
 
 describe('GET /.well-known/oauth-protected-resource', () => {
